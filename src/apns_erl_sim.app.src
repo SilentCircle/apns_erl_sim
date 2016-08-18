@@ -1,0 +1,34 @@
+{application, apns_erl_sim,
+ [{description, "An APNS HTTP/2 simulator"},
+  {vsn, "0.1.0"},
+  {registered, [apns_erl_sim,
+                apns_erl_sim_sup]},
+  {mod, { apns_erl_sim_app, []}},
+  {applications,
+   [kernel,
+    stdlib,
+    sasl,
+    crypto,
+    public_key,
+    ssl,
+    lager,
+    uuid,
+    jsx,
+    sc_util,
+    apns_erl_util,
+    chatterbox
+   ]},
+  {included_applications, [ranch]},
+  {env,
+   [
+    {lager, [{handlers, [{lager_console_backend, debug}]}]}
+   ]},
+  {modules, [
+             apns_erl_sim,
+             apns_erl_sim_app,
+             apns_erl_sim_sup
+            ]},
+  {maintainers, []},
+  {licenses, []},
+  {links, []}
+ ]}.

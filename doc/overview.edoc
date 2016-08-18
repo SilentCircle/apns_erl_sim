@@ -1,0 +1,49 @@
+@author Edwin Fine <efine@silentcircle.com>
+@copyright 2016 Silent Circle, LLC.
+@version {@version}
+@title Apple Push Notification Service HTTP/2 simulator.
+@doc
+This application is an HTTP/2 simulator for APNS push.
+
+It allows the tester to control the response to a push notification POST via
+custom HTTP/2 headers.
+
+=== Header Values ===
+
+<table>
+<tr>
+    <th>Header</th><th>Description</th>
+</tr>
+<tr>
+    <td>X-ApnsTester-StatusCode</td>
+    <td>
+    HTTP status code, e.g. 200; omit for 200
+    </td>
+</tr>
+<tr>
+    <td>X-ApnsTester-Body</td>
+    <td>Base-64 encoded JSON return value; omit for empty body</td>
+</tr>
+<tr>
+    <td>X-ApnsTester-Delay</td>
+    <td>Delay before responding, in ms; Omit for no delay</td>
+</tr>
+<tr>
+    <td>X-ApnsTester-Reason</td>
+    <td>
+    One of the reason strings, such as `PayloadEmpty'.
+    If X-ApnsTester-StatusCode is omitted, a 4xx status
+    code will be returned.
+    </td>
+</tr>
+</table>
+
+=== Document Building ===
+
+This uses `edown' to build markdown documents from `edoc'.  There is some
+special code in `rebar.config.script' to support obtaining the version from the
+`APP_CONFIG' file and making it available to edoc via the `@version' macro.
+
+See `rebar.config.script' for usage and behavior.
+
+@end
