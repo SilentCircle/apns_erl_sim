@@ -1,39 +1,77 @@
+%%% ==========================================================================
+%%% Copyright 2016 Silent Circle
+%%%
+%%% Licensed under the Apache License, Version 2.0 (the "License");
+%%% you may not use this file except in compliance with the License.
+%%% You may obtain a copy of the License at
+%%%
+%%%     http://www.apache.org/licenses/LICENSE-2.0
+%%%
+%%% Unless required by applicable law or agreed to in writing, software
+%%% distributed under the License is distributed on an "AS IS" BASIS,
+%%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%%% See the License for the specific language governing permissions and
+%%% limitations under the License.
+%%% ==========================================================================
+
 @author Edwin Fine <efine@silentcircle.com>
 @copyright 2016 Silent Circle, LLC.
 @version {@version}
 @title Apple Push Notification Service HTTP/2 simulator.
-@doc
-This application is an HTTP/2 simulator for APNS push.
+@doc This application is an HTTP/2 simulator for APNS push.
 
-It allows the tester to control the response to a push notification POST via
-custom HTTP/2 headers.
+The simulator tries very hard to behave like Apple's HTTP/2 push service,
+at least as of this writing. It doesn't throttle requests (yet), but its
+responses look a lot like the real thing.
 
-=== Header Values ===
+It also allows the tester to control the response to a push notification POST
+via keys in the notification JSON. This is easy to do without risking behavioral
+issues, since APNS allows user-defined JSON outside of the `aps' dictionary.
+
+=== Simulator Configuration JSON ===
+
+The JSON is a dictionary at the top level of the notification, named
+`"sim_cfg"'.
+
+==== Example ====
+
+```
+{
+    "aps": {
+        "alert": "blah"
+    },
+    "sim_cfg": {
+        "status_code": 200,
+        "body": "eyJyZWFzb24iOiJCYWRQcmlvcml0eSJ9",
+        "delay": 5000,
+        "reason": "BadPriority"
+    }
+}
+'''
 
 <table>
 <tr>
-    <th>Header</th><th>Description</th>
+    <th>Key</th><th>Description</th>
 </tr>
 <tr>
-    <td>X-ApnsTester-StatusCode</td>
+    <td>`"status_code"'</td>
     <td>
     HTTP status code, e.g. 200; omit for 200
     </td>
 </tr>
 <tr>
-    <td>X-ApnsTester-Body</td>
+    <td>`"body"'</td>
     <td>Base-64 encoded JSON return value; omit for empty body</td>
 </tr>
 <tr>
-    <td>X-ApnsTester-Delay</td>
-    <td>Delay before responding, in ms; Omit for no delay</td>
+    <td>`"delay"'</td>
+    <td>Delay before responding, in ms; omit for no delay</td>
 </tr>
 <tr>
-    <td>X-ApnsTester-Reason</td>
+    <td>`"reason"'</td>
     <td>
-    One of the reason strings, such as `PayloadEmpty'.
-    If X-ApnsTester-StatusCode is omitted, a 4xx status
-    code will be returned.
+    One of the reason strings, such as `PayloadEmpty'.  If `"status_code"' is
+    omitted, a 4xx status code will be returned.
     </td>
 </tr>
 </table>
@@ -42,7 +80,7 @@ custom HTTP/2 headers.
 
 This uses `edown' to build markdown documents from `edoc'.  There is some
 special code in `rebar.config.script' to support obtaining the version from the
-`APP_CONFIG' file and making it available to edoc via the `@version' macro.
+`APP_VERSION' file and making it available to edoc via the `@version' macro.
 
 See `rebar.config.script' for usage and behavior.
 

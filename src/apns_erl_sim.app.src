@@ -26,6 +26,7 @@
   {modules, [
              apns_erl_sim,
              apns_erl_sim_app,
+             apns_erl_sim_stream,
              apns_erl_sim_sup
             ]},
   {maintainers, []},
