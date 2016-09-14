@@ -19,6 +19,56 @@ via keys in the notification JSON. This is easy to do without risking behavioral
 issues, since APNS allows user-defined JSON outside of the `aps` dictionary.
 
 
+#### <a name="Running">Running</a> ####
+
+`apns_erl_sim` is intended to be integrated with test cases by starting it in
+a different node as an application.
+
+However, you can run it from the command line using `make run`. This starts
+it in an Erlang shell and is identical to calling `rebar3 shell`.
+
+
+#### <a name="Configuration">Configuration</a> ####
+
+By default, it is configured to listen on IPv4 address `0.0.0.0:2197`. The
+configuration is in `config/sys.config`. Because the simulator uses
+[`chatterbox`](https://github.com/joedevivo/chatterbox.git) for HTTP/2,
+the configuration sets up `chatterbox` something like this:
+
+```
+  {chatterbox,
+   [
+    {ssl, true},
+    {ssl_options, [{port,       2197},
+                   {certfile,   "com.apple.push.api.cert.pem"},
+                   {keyfile,    "com.apple.push.api.key.unencrypted.pem"},
+                   {cacertfile, "FakeAppleAllCAChain.cert.pem"},
+                   {honor_cipher_order, false},
+                   {fail_if_no_peer_cert, true},
+                   {verify, verify_peer},
+                   {versions, ['tlsv1.2']},
+                   {alpn_preferred_protocols, [<<"h2">>]}]}
+   ]}
+```
+
+It's recommended that only `port`, `certfile`, `keyfile`, or `cacertfile` be
+changed.
+
+
+#### <a name="Fake_certificates">Fake certificates</a> ####
+
+`cacertfile`, `certfile`, and `keyfile` are fake Apple certificates generated
+by a script in the [`apns_tools`](https://github.com/SilentCircle/apns_tools.git) github
+repository.
+`apns_tools/fake_apple_certs.sh` generates an entire fake Apple Push PKI infrastructure.
+
+To use this simulator, you'll need to use `fake_apple_certs.sh` to generate your own
+fake certificates - both for the simulator and for whatever push client uses it.
+A great way to do this is to generate the certs every time you run your test cases,
+and put them somewhere that both the simulator and the test code and get to them.
+This avoids expiry and other issues, and takes only a few extra seconds of runtime.
+
+
 #### <a name="Simulator_Configuration_JSON">Simulator Configuration JSON</a> ####
 
 The JSON is a dictionary at the top level of the notification, named
@@ -66,6 +116,11 @@ special code in `rebar.config.script` to support obtaining the version from the
 `APP_VERSION` file and making it available to edoc via the `@version` macro.
 
 See `rebar.config.script` for usage and behavior.
+
+
+#### <a name="TODO">TODO</a> ####
+- Use `apns_tools` to auto-generate certificates to be used by `make run`, instead
+  of using the certificates in `config/`, which will eventually expire.
 
 
 ## Modules ##
