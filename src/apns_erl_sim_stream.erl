@@ -75,7 +75,7 @@
 %%% h2_stream callback functions
 %%%====================================================================
 -spec init(ConnPid, StreamId) -> Result when
-      ConnPid :: pid(), StreamId :: stream_id(), Result :: state().
+      ConnPid :: pid(), StreamId :: stream_id(), Result :: {ok, state()}.
 init(ConnPid, StreamId) ->
     %% You need to pull settings here from application:env or something
     {ok, make_state(ConnPid, StreamId)}.
@@ -472,7 +472,7 @@ reason(Rsn, RsnMap) when is_atom(Rsn) andalso is_map(RsnMap) ->
 %%--------------------------------------------------------------------
 -spec status_hdr(Rsn, StsMap) -> Result when
       Rsn :: atom(), StsMap :: map(),
-      Result :: {binary(), undefined | binary()}.
+      Result :: {binary(), binary()}.
 status_hdr(Rsn, StsMap) when is_atom(Rsn) andalso is_map(StsMap) ->
     case maps:find(Rsn, StsMap) of
         {ok, Val} ->
@@ -486,12 +486,8 @@ status_hdr(Rsn, StsMap) when is_atom(Rsn) andalso is_map(StsMap) ->
 
 %%--------------------------------------------------------------------
 response_from_reason(ReasonName, ExtraHdrs, S) when is_atom(ReasonName) ->
-    case status_hdr(ReasonName, S#?S.sts_hdrs) of
-        {StsHdr, undefined} ->
-            {[StsHdr | ExtraHdrs], maybe_reason(ReasonName, S)};
-        {StsHdr, Reason} ->
-            {[StsHdr | ExtraHdrs], Reason}
-    end.
+    {StsHdr, Reason} = status_hdr(ReasonName, S#?S.sts_hdrs),
+    {[StsHdr | ExtraHdrs], Reason}.
 
 %%--------------------------------------------------------------------
 reason_for_status_code(Sts) ->
