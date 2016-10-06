@@ -245,13 +245,12 @@ get_sim_sts_body(StatusCode, Reason, #?S{} = S) ->
         {<<"200">>, <<>>} ->
             {{<<":status">>, <<"200">>}, undefined};
         {<<SC/binary>>, <<>>} when SC /= <<>> ->
-            ReasonName = reason_for_status_code(StatusCode),
-            {{<<":status">>, StatusCode}, reason(ReasonName, S#?S.reasons)};
+            Rsn = reason_for_status_code(SC),
+            status_hdr(Rsn, S#?S.sts_hdrs);
         {<<>>, <<Rsn/binary>>} when Rsn /= <<>> ->
-            status_hdr(b2a(Reason), S#?S.sts_hdrs);
-        _ ->
-            ReasonName = b2a(Reason),
-            {{<<":status">>, StatusCode}, reason(ReasonName, S#?S.reasons)}
+            status_hdr(b2a(Rsn), S#?S.sts_hdrs);
+        {<<SC/binary>>, <<Rsn/binary>>} ->
+            encode_status_hdr({<<":status">>, SC}, b2a(Rsn))
     end.
 
 %%--------------------------------------------------------------------
@@ -476,13 +475,26 @@ reason(Rsn, RsnMap) when is_atom(Rsn) andalso is_map(RsnMap) ->
 status_hdr(Rsn, StsMap) when is_atom(Rsn) andalso is_map(StsMap) ->
     case maps:find(Rsn, StsMap) of
         {ok, Val} ->
-            {Val, jsx:encode([{reason, list_to_binary(atom_to_list(Rsn))}])};
+            encode_status_hdr(Val, Rsn);
         error ->
             {{<<":status">>, <<"400">>},
              jsx:encode([{reason, list_to_binary([<<"Unknown reason: ">>,
                                                   atom_to_list(Rsn)])}])}
     end.
 
+
+%%--------------------------------------------------------------------
+encode_status_hdr({<<":status">>, Sts} = Val, Rsn) when is_binary(Sts),
+                                                        is_atom(Rsn) ->
+    {Val, jsx:encode([
+                      {reason, list_to_binary(atom_to_list(Rsn))}
+                     ] ++ maybe_ts(Sts))}.
+
+%%--------------------------------------------------------------------
+maybe_ts(<<"410">>) ->
+    [{timestamp, erlang:system_time(milli_seconds)}];
+maybe_ts(_) ->
+    [].
 
 %%--------------------------------------------------------------------
 response_from_reason(ReasonName, ExtraHdrs, S) when is_atom(ReasonName) ->
@@ -556,7 +568,7 @@ status_list() ->
      {'BadPath',                    <<"400">>},
      {'BadPriority',                <<"400">>},
      {'BadTopic',                   <<"400">>},
-     {'DeviceTokenNotForTopic',     <<"410">>},
+     {'DeviceTokenNotForTopic',     <<"400">>},
      {'DuplicateHeaders',           <<"400">>},
      {'Forbidden',                  <<"400">>},
      {'IdleTimeout',                <<"503">>},
@@ -570,7 +582,7 @@ status_list() ->
      {'Shutdown',                   <<"503">>},
      {'TooManyRequests',            <<"429">>},
      {'TopicDisallowed',            <<"400">>},
-     {'Unregistered',               <<"400">>},
+     {'Unregistered',               <<"410">>},
      {success,                      <<"200">>}
     ].
 
