@@ -379,8 +379,10 @@ check_topic(ApnsTopic, CertInfo) ->
             get_default_topic(IsMultTopics, CertSubjUid);
         IsMultTopics ->
             get_topic_from_topics(ApnsTopic, Topics);
+        ApnsTopic == CertSubjUid ->
+            {CertSubjUid, undefined};
         true ->
-            'InternalServerError'
+            'BadTopic'
     end.
 
 
@@ -471,7 +473,8 @@ reason(Rsn, RsnMap) when is_atom(Rsn) andalso is_map(RsnMap) ->
 %%--------------------------------------------------------------------
 -spec status_hdr(Rsn, StsMap) -> Result when
       Rsn :: atom(), StsMap :: map(),
-      Result :: {binary(), binary()}.
+      Result :: {StsHdr, JSON}, StsHdr :: {Key, Val}, JSON :: binary(),
+      Key :: binary(), Val :: binary().
 status_hdr(Rsn, StsMap) when is_atom(Rsn) andalso is_map(StsMap) ->
     case maps:find(Rsn, StsMap) of
         {ok, Val} ->

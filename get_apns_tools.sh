@@ -37,7 +37,7 @@ get_tools() {
     fi
 
     popd > /dev/null 2>&1
-    test $upstream_did_change
+    $upstream_did_change
 }
 
 generate_new_certs() {
@@ -57,13 +57,15 @@ copy_cert_data() {
     [[ -d ${CA_DIR} ]] || die "Expected ${CA_DIR} to exist"
 
     mkdir -p ${CERTS_DIR}
-    find ${CERTS_DIR} -name '*.pem' | xargs rm -f
+    chmod -R a+w ${CERTS_DIR}
+    find ${CERTS_DIR} -name '*.pem' -delete
 
     cp ${CA_DIR}/*.pem ${CERTS_DIR}/
 
     for dir in $CA_DIR ${CA_DIR}/WWDRCA ${CA_DIR}/ISTCA2G1; do
         cp $dir/{certs,private}/*.pem ${CERTS_DIR}/
     done
+    chmod -R a+r ${CERTS_DIR}
 }
 
 if get_tools; then
