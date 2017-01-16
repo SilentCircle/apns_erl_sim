@@ -84,32 +84,34 @@ init(ConnPid, StreamId) ->
 -spec on_receive_request_headers(Headers, State) -> Result when
       Headers :: h2_headers(), State :: state(), Result :: {ok, state()}.
 on_receive_request_headers(Headers, #?S{req=Req, stream=Strm}=State) ->
-    lager:info("~p:on_receive_request_headers(~p, ~p)",
-               [?MODULE, Headers, Req]),
+    lager:info("[~p:~p][StrId:~B] on_receive_request_headers(~p, ~p)",
+               [?MODULE, self(), Strm#stream.id, Headers, Req]),
     {ok, PeerCertDer} = h2_connection:get_peercert(Strm#stream.conn_pid),
     PeerCert = apns_cert:der_decode_cert(PeerCertDer),
     PeerCertInfo = apns_cert:get_cert_info_map(PeerCert),
     {ok, State#?S{req=Req#req{headers=Headers}, peercert=PeerCertInfo}}.
 
 %%--------------------------------------------------------------------
-on_send_push_promise(Headers, #?S{req=Req}=State) ->
-    lager:info("~p:on_send_push_promise(~p, ~p)", [Headers, Req]),
+on_send_push_promise(Headers, #?S{stream=Stream, req=Req}=State) ->
+    lager:info("[~p:~p][StrId:~B] on_send_push_promise(~p, ~p)",
+               [?MODULE, self(), Stream#stream.id, Headers, Req]),
     {ok, State#?S{req=Req#req{headers=Headers}}}.
 
 %%--------------------------------------------------------------------
-on_receive_request_data(Bin, #?S{req=Req}=State)->
-    lager:info("~p:on_receive_request_data(~p, ~p)",
-               [?MODULE, Bin, Req]),
+on_receive_request_data(Bin, #?S{stream=Stream, req=Req}=State)->
+    lager:info("[~p:~p][StrId:~B] on_receive_request_data(~p, ~p)",
+               [?MODULE, self(), Stream#stream.id, Bin, Req]),
     {ok, State#?S{req=Req#req{data=Bin}}}.
 
 %%--------------------------------------------------------------------
 on_request_end_stream(#?S{stream=Stream, req=Req} = State) ->
-    lager:info("~p:on_request_end_stream(~p)", [?MODULE, [Stream, Req]]),
+    lager:info("[~p:~p][StrId:~B] on_request_end_stream(~p)",
+               [?MODULE, self(), Stream, Req]),
     Headers = Req#req.headers,
     Method = proplists:get_value(<<":method">>, Headers),
     Path = binary_to_list(proplists:get_value(<<":path">>, Headers)),
 
-    lager:debug("[~p:~p:~p] ~s ~s",
+    lager:debug("[~p:~p][StrId:~B] method:~s path:~s",
                 [?MODULE, self(), Stream#stream.id, Method, Path]),
 
     handle_request(Method, Path, Headers, State),
@@ -140,7 +142,7 @@ generate_push_promise_headers(Request, Path) ->
 handle_request(Method, Path, Headers, #?S{stream=#stream{id=SID,
                                                          conn_pid=CID}}=St) ->
     Rsp = make_response(Method, Path, Headers, St),
-    lager:debug("[~p:~p:~p] sending response ~p",
+    lager:debug("[~p:~p][StrId:~B] sending response ~p",
                 [?MODULE, self(), SID, Rsp]),
     send_response(CID, SID, Rsp).
 
@@ -155,7 +157,9 @@ make_response(_, _Other, Headers,  #?S{}=S) ->
 
 
 %%--------------------------------------------------------------------
-handle_post(Headers, Token, #?S{req=#req{data=Payload}, peercert=Cert}=S) ->
+handle_post(Headers, Token, #?S{req=#req{data=Payload},
+                                stream=Stream,
+                                peercert=Cert}=S) ->
     try
         ApnsIdHdr = case check_apns_id_hdr(Headers) of
                         {ok, Hdr} ->
@@ -167,8 +171,10 @@ handle_post(Headers, Token, #?S{req=#req{data=Payload}, peercert=Cert}=S) ->
         check_token(Token),
         JSON = check_payload(Payload),
         ReqMap = check_headers(Headers, Cert, JSON),
-        lager:info("[~p:handle_post] JSON: ~p", [?MODULE, JSON]),
-        lager:info("[~p:handle_post] ReqMap: ~p", [?MODULE, ReqMap]),
+        lager:info("[~p:handle_post:~p][StrId:~B] JSON: ~p",
+                   [?MODULE, self(), Stream#stream.id, JSON]),
+        lager:info("[~p:handle_post:~p][StrId:~B] ReqMap: ~p",
+                   [?MODULE, self(), Stream#stream.id, ReqMap]),
         handle_req_map(ReqMap, RespHdrs, S)
     catch
         error:{badmatch, Status} ->
@@ -180,7 +186,7 @@ handle_post(Headers, Token, #?S{req=#req{data=Payload}, peercert=Cert}=S) ->
     end.
 
 %%--------------------------------------------------------------------
-handle_req_map(ReqMap, RespHdrs, S) ->
+handle_req_map(ReqMap, RespHdrs, #?S{stream=Stream}=S) ->
     %% TODO: maybe validate the request JSON, but could be lots of work for
     %% little reward
     %% validate_aps_json(ReqMap)
@@ -190,7 +196,8 @@ handle_req_map(ReqMap, RespHdrs, S) ->
         Ms when is_integer(Ms), Ms =< 0 ->
             ok;
         Ms when is_integer(Ms) ->
-            lager:info("[~p:handle_req_map] Delaying for ~B ms", [?MODULE, Delay]),
+            lager:info("[~p:handle_req_map:~p][StrId:~B] Delaying for ~B ms",
+                       [?MODULE, self(), Stream#stream.id, Delay]),
             receive after Ms -> ok end
     end,
     Response.
