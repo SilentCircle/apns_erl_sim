@@ -32,13 +32,15 @@
 
 start(_StartType, _StartArgs) ->
     setup_env(),
+    RanchTcpProto = case application:get_env(chatterbox, ssl) of
+                        {ok, true} -> ranch_ssl;
+                        _          -> ranch_tcp
+                    end,
     Options = case application:get_env(chatterbox, ssl_options) of
-                  {ok, SslOpts} ->
-                      SslOpts;
-                  _ ->
-                      default_options()
+                  {ok, SslOpts} -> SslOpts;
+                  _             -> default_options(RanchTcpProto)
               end,
-    apns_erl_sim_sup:start_link(Options).
+    apns_erl_sim_sup:start_link({RanchTcpProto, Options}).
 
 %%--------------------------------------------------------------------
 stop(_State) ->
@@ -49,13 +51,14 @@ stop(_State) ->
 %%====================================================================
 
 setup_env() ->
-    application:set_env(
-      chatterbox,
-      stream_callback_mod,
-      apns_erl_sim_stream).
+    application:set_env(chatterbox, stream_callback_mod, apns_erl_sim_stream).
 
 %% Set up default socket options
-default_options() ->
+default_options(ranch_tcp) ->
+    [
+     {port, 2197}
+    ];
+default_options(ranch_ssl) ->
     [
      {port, 2197},
      {certfile, "localhost.crt"},

@@ -35,15 +35,19 @@
 %% API functions
 %%====================================================================
 
-start_link(Options) when is_list(Options) ->
-    supervisor:start_link({local, ?SERVER}, ?MODULE, Options).
+start_link({TcpProto, Options}=Arg) when (TcpProto == ranch_ssl orelse
+                                          TcpProto == ranch_tcp) andalso
+                                         is_list(Options) ->
+    supervisor:start_link({local, ?SERVER}, ?MODULE, Arg).
 
 %%====================================================================
 %% Supervisor callbacks
 %%====================================================================
 
 %% Child :: {Id,StartFunc,Restart,Shutdown,Type,Modules}
-init(Options) when is_list(Options) ->
+init({RanchTcpProto, Options}) when (RanchTcpProto == ranch_ssl orelse
+                                     RanchTcpProto == ranch_tcp) andalso
+                                    is_list(Options) ->
     RanchSupSpec = #{id       => ranch_sup,
                      start    => {ranch_sup, start_link, []},
                      restart  => permanent,
@@ -53,7 +57,7 @@ init(Options) when is_list(Options) ->
 
     ListenerSpec = ranch:child_spec(chatterbox_ranch_protocol,
                                     10,
-                                    ranch_ssl,
+                                    RanchTcpProto,
                                     Options,
                                     chatterbox_ranch_protocol,
                                     []),

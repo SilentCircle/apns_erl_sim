@@ -66,7 +66,7 @@
            stream   = #stream{} :: stream_rec(),
            reasons  = reasons() :: map(),
            sts_hdrs = status_hdrs() :: map(),
-           peercert = #{} :: map()
+           peercert = undefined :: undefined | map()
           }).
 
 -type state() :: #?S{}.
@@ -83,13 +83,19 @@ init(ConnPid, StreamId) ->
 %%--------------------------------------------------------------------
 -spec on_receive_request_headers(Headers, State) -> Result when
       Headers :: h2_headers(), State :: state(), Result :: {ok, state()}.
-on_receive_request_headers(Headers, #?S{req=Req, stream=Strm}=State) ->
+on_receive_request_headers(Headers, #?S{req=Req, stream=Strm}=State0) ->
     lager:info("[~p:~p][StrId:~B] on_receive_request_headers(~p, ~p)",
                [?MODULE, self(), Strm#stream.id, Headers, Req]),
-    {ok, PeerCertDer} = h2_connection:get_peercert(Strm#stream.conn_pid),
-    PeerCert = apns_cert:der_decode_cert(PeerCertDer),
-    PeerCertInfo = apns_cert:get_cert_info_map(PeerCert),
-    {ok, State#?S{req=Req#req{headers=Headers}, peercert=PeerCertInfo}}.
+    State = case h2_connection:get_peercert(Strm#stream.conn_pid) of
+                {ok, PeerCertDer} ->
+                    PeerCert = apns_cert:der_decode_cert(PeerCertDer),
+                    PeerCertInfo = apns_cert:get_cert_info_map(PeerCert),
+                    State0#?S{req=Req#req{headers=Headers},
+                              peercert=PeerCertInfo};
+                {error, _} ->
+                    State0#?S{req=Req#req{headers=Headers}}
+            end,
+    {ok, State}.
 
 %%--------------------------------------------------------------------
 on_send_push_promise(Headers, #?S{stream=Stream, req=Req}=State) ->
@@ -160,6 +166,8 @@ make_response(_, _Other, Headers,  #?S{}=S) ->
 handle_post(Headers, Token, #?S{req=#req{data=Payload},
                                 stream=Stream,
                                 peercert=Cert}=S) ->
+    lager:debug("[~p:handle_post:~p][StrId:~B]\nReq: ~p\nCert: ~p",
+                   [?MODULE, self(), Stream#stream.id, S#?S.req, Cert]),
     try
         ApnsIdHdr = case check_apns_id_hdr(Headers) of
                         {ok, Hdr} ->
@@ -367,13 +375,17 @@ check_payload(Payload) ->
 
 %%--------------------------------------------------------------------
 -spec check_topic(ApnsTopic, CertInfo) -> Result when
-      ApnsTopic :: undefined | binary(), CertInfo :: map(),
+      ApnsTopic :: undefined | binary(), CertInfo :: undefined | map(),
       Result :: 'BadCertificate'
               | 'InternalServerError'
               | 'MissingTopic'
               | {Topic, App},
       Topic :: binary(), App :: undefined | binary().
-check_topic(ApnsTopic, CertInfo) ->
+check_topic(undefined, undefined) ->
+    'MissingTopic';
+check_topic(<<ApnsTopic/binary>>, undefined) ->
+    {ApnsTopic, undefined};
+check_topic(<<ApnsTopic/binary>>, #{}=CertInfo) ->
     Topics = get_cert_topics(CertInfo),
     IsMultTopics = is_list(Topics),
     CertSubjUid = get_cert_subject_uid(CertInfo),
