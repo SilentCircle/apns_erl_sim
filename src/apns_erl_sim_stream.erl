@@ -74,18 +74,17 @@
 %%%====================================================================
 %%% h2_stream callback functions
 %%%====================================================================
--spec init(ConnPid, StreamId) -> Result when
-      ConnPid :: pid(), StreamId :: stream_id(), Result :: {ok, state()}.
-init(ConnPid, StreamId) ->
+-spec init(ConnPid, StrmId) -> Result when
+      ConnPid :: pid(), StrmId :: stream_id(), Result :: {ok, state()}.
+init(ConnPid, StrmId) ->
     %% You need to pull settings here from application:env or something
-    {ok, make_state(ConnPid, StreamId)}.
+    {ok, make_state(ConnPid, StrmId)}.
 
 %%--------------------------------------------------------------------
 -spec on_receive_request_headers(Headers, State) -> Result when
       Headers :: h2_headers(), State :: state(), Result :: {ok, state()}.
 on_receive_request_headers(Headers, #?S{req=Req, stream=Strm}=State0) ->
-    lager:info("[~p:~p][StrId:~B] on_receive_request_headers(~p, ~p)",
-               [?MODULE, self(), Strm#stream.id, Headers, Req]),
+    lager:info("[StrId:~B] Hdrs: ~p\nReq: ~p", [Strm#stream.id, Headers, Req]),
     State = case h2_connection:get_peercert(Strm#stream.conn_pid) of
                 {ok, PeerCertDer} ->
                     PeerCert = apns_cert:der_decode_cert(PeerCertDer),
@@ -98,31 +97,30 @@ on_receive_request_headers(Headers, #?S{req=Req, stream=Strm}=State0) ->
     {ok, State}.
 
 %%--------------------------------------------------------------------
-on_send_push_promise(Headers, #?S{stream=Stream, req=Req}=State) ->
-    lager:info("[~p:~p][StrId:~B] on_send_push_promise(~p, ~p)",
-               [?MODULE, self(), Stream#stream.id, Headers, Req]),
+on_send_push_promise(Headers, #?S{stream=Strm, req=Req}=State) ->
+    lager:info("[StrId:~B] Hdrs: ~p, Req: ~p", [Strm#stream.id, Headers, Req]),
     {ok, State#?S{req=Req#req{headers=Headers}}}.
 
 %%--------------------------------------------------------------------
-on_receive_request_data(Bin, #?S{stream=Stream, req=Req}=State)->
-    lager:info("[~p:~p][StrId:~B] on_receive_request_data(~p, ~p)",
-               [?MODULE, self(), Stream#stream.id, Bin, Req]),
-    {ok, State#?S{req=Req#req{data=Bin}}}.
+%% Since we can receive multiple DATA frames in a single stream, append any
+%% data received to the data we have in the state. Because chatterbox maintains
+%% a separate state variable for each stream, which is (presumably) destroyed
+%% after the end of the stream, this should work correctly.
+%%
+on_receive_request_data(Bin, #?S{stream=Strm, req=#req{data=Data}=Req}=State) ->
+    lager:info("[StrId:~B]\nData: ~p\nReq: ~p", [Strm#stream.id, Bin, Req]),
+    {ok, State#?S{req=Req#req{data = <<Data/binary, Bin/binary>>}}}.
 
 %%--------------------------------------------------------------------
-on_request_end_stream(#?S{stream=Stream, req=Req} = State) ->
-    lager:info("[~p:~p][StrId:~B] on_request_end_stream(~p)",
-               [?MODULE, self(), Stream, Req]),
+on_request_end_stream(#?S{stream=#stream{id=StrmId}, req=Req} = State) ->
+    lager:info("[StrId:~B] Req: ~p", [StrmId, Req]),
     Headers = Req#req.headers,
     Method = proplists:get_value(<<":method">>, Headers),
     Path = binary_to_list(proplists:get_value(<<":path">>, Headers)),
 
-    lager:debug("[~p:~p][StrId:~B] method:~s path:~s",
-                [?MODULE, self(), Stream#stream.id, Method, Path]),
-
+    lager:debug("[StrId:~B] method:~s path:~s", [StrmId, Method, Path]),
     handle_request(Method, Path, Headers, State),
-
-    {ok, State}.
+    {ok, State#?S{req=#req{}}}. % Be paranoid and clear req data
 
 
 %%%====================================================================
@@ -130,8 +128,8 @@ on_request_end_stream(#?S{stream=Stream, req=Req} = State) ->
 %%%====================================================================
 
 %%--------------------------------------------------------------------
-make_state(ConnPid, StreamId) ->
-    #?S{stream = #stream{conn_pid = ConnPid, id = StreamId}}.
+make_state(ConnPid, StrmId) ->
+    #?S{stream = #stream{conn_pid = ConnPid, id = StrmId}}.
 
 %%--------------------------------------------------------------------
 -spec generate_push_promise_headers(hpack:headers(), binary()) -> hpack:headers().
@@ -148,8 +146,7 @@ generate_push_promise_headers(Request, Path) ->
 handle_request(Method, Path, Headers, #?S{stream=#stream{id=SID,
                                                          conn_pid=CID}}=St) ->
     Rsp = make_response(Method, Path, Headers, St),
-    lager:debug("[~p:~p][StrId:~B] sending response ~p",
-                [?MODULE, self(), SID, Rsp]),
+    lager:debug("[StrId:~B] sending response ~p", [SID, Rsp]),
     send_response(CID, SID, Rsp).
 
 
@@ -164,10 +161,9 @@ make_response(_, _Other, Headers,  #?S{}=S) ->
 
 %%--------------------------------------------------------------------
 handle_post(Headers, Token, #?S{req=#req{data=Payload},
-                                stream=Stream,
+                                stream=#stream{id=StrmId},
                                 peercert=Cert}=S) ->
-    lager:debug("[~p:handle_post:~p][StrId:~B]\nReq: ~p\nCert: ~p",
-                   [?MODULE, self(), Stream#stream.id, S#?S.req, Cert]),
+    lager:debug("[StrId:~B]\nReq: ~p\nCert: ~p", [StrmId, S#?S.req, Cert]),
     try
         ApnsIdHdr = case check_apns_id_hdr(Headers) of
                         {ok, Hdr} ->
@@ -179,10 +175,7 @@ handle_post(Headers, Token, #?S{req=#req{data=Payload},
         check_token(Token),
         JSON = check_payload(Payload),
         ReqMap = check_headers(Headers, Cert, JSON),
-        lager:info("[~p:handle_post:~p][StrId:~B] JSON: ~p",
-                   [?MODULE, self(), Stream#stream.id, JSON]),
-        lager:info("[~p:handle_post:~p][StrId:~B] ReqMap: ~p",
-                   [?MODULE, self(), Stream#stream.id, ReqMap]),
+        lager:info("[StrId:~B]\nJSON: ~p\nReqMap: ~p", [StrmId, JSON, ReqMap]),
         handle_req_map(ReqMap, RespHdrs, S)
     catch
         error:{badmatch, Status} ->
@@ -194,7 +187,7 @@ handle_post(Headers, Token, #?S{req=#req{data=Payload},
     end.
 
 %%--------------------------------------------------------------------
-handle_req_map(ReqMap, RespHdrs, #?S{stream=Stream}=S) ->
+handle_req_map(ReqMap, RespHdrs, #?S{stream=#stream{id=StrmId}}=S) ->
     %% TODO: maybe validate the request JSON, but could be lots of work for
     %% little reward
     %% validate_aps_json(ReqMap)
@@ -204,22 +197,31 @@ handle_req_map(ReqMap, RespHdrs, #?S{stream=Stream}=S) ->
         Ms when is_integer(Ms), Ms =< 0 ->
             ok;
         Ms when is_integer(Ms) ->
-            lager:info("[~p:handle_req_map:~p][StrId:~B] Delaying for ~B ms",
-                       [?MODULE, self(), Stream#stream.id, Delay]),
-            receive after Ms -> ok end
+            lager:info("[StrId:~B] Delaying for ~B ms", [StrmId, Ms]),
+            sleep(Ms)
     end,
     Response.
 
 %%--------------------------------------------------------------------
--define(pv(K, Cfg, Default), proplists:get_value(K, Cfg, Default)).
--define(sim_status_code(Cfg), sc_util:to_bin(?pv(<<"status_code">>, Cfg, <<>>))).
--define(sim_body(Cfg), base64:decode(?pv(<<"body">>, Cfg, <<>>))).
--define(sim_delay(Cfg), ?pv(<<"delay">>, Cfg, 0)).
--define(sim_reason(Cfg), ?pv(<<"reason">>, Cfg, <<>>)).
+sleep(Ms) ->
+    receive after Ms -> ok end.
 
--define (dbg_msg(Fmt, Args),
-         lager:info("[~s:~B] " ++ Fmt,
-                    [filename:basename(?FILE), ?LINE] ++ Args)).
+%%--------------------------------------------------------------------
+pv(K, Cfg, Default) ->
+    case lists:keyfind(K, 1, Cfg) of
+        {_, V} -> V;
+        false  -> Default
+    end.
+
+-compile({inline, [pv/3]}).
+
+%%--------------------------------------------------------------------
+-define(sim_status_code(Cfg), sc_util:to_bin(pv(<<"status_code">>, Cfg, <<>>))).
+-define(sim_body(Cfg), base64:decode(pv(<<"body">>, Cfg, <<>>))).
+-define(sim_delay(Cfg), pv(<<"delay">>, Cfg, 0)).
+-define(sim_reason(Cfg), pv(<<"reason">>, Cfg, <<>>)).
+
+-define(dbg_msg(Fmt, Args), lager:info(Fmt, Args)).
 
 % Precedence is:
 %
@@ -239,14 +241,19 @@ make_sim_response(SimCfg, RespHdrs, S) ->
     Body = ?sim_body(SimCfg),
     Delay = ?sim_delay(SimCfg),
 
-    ?dbg_msg("StatusCode = ~p\n", [StatusCode]),
-    ?dbg_msg("Reason = ~p\n", [Reason]),
-    ?dbg_msg("Body = ~p\n", [Body]),
-    ?dbg_msg("Delay = ~p\n", [Delay]),
+    ?dbg_msg("\n"
+             "StatusCode = ~p\n"
+             "Reason = ~p\n"
+             "Body = ~p\n"
+             "Delay = ~p\n",
+             [StatusCode, Reason, Body, Delay]),
 
     {StsHdr, BodyOverride} = get_sim_sts_body(StatusCode, Reason, S),
-    ?dbg_msg("StsHdr = ~p\n", [StsHdr]),
-    ?dbg_msg("BodyOverride = ~p\n", [BodyOverride]),
+    ?dbg_msg("\n"
+             "StsHdr = ~p\n"
+             "BodyOverride = ~p\n",
+             [StsHdr, BodyOverride]),
+
     Response = {[StsHdr | RespHdrs], maybe_override_body(Body, BodyOverride)},
     ?dbg_msg("Response = ~p\n", [Response]),
     {Response, Delay}.
@@ -268,6 +275,8 @@ get_sim_sts_body(StatusCode, Reason, #?S{} = S) ->
             encode_status_hdr({<<":status">>, SC}, b2a(Rsn))
     end.
 
+-compile({inline, [get_sim_sts_body/3]}).
+
 %%--------------------------------------------------------------------
 maybe_override_body(<<>>, OBody) ->
     OBody;
@@ -276,15 +285,27 @@ maybe_override_body(Body, undefined) ->
 maybe_override_body(_Body, OBody) ->
     OBody.
 
-%%--------------------------------------------------------------------
-get_sim_cfg(#{apns_json := JSON}) ->
-    proplists:get_value(<<"sim_cfg">>, JSON, []).
+-compile({inline, [maybe_override_body/2]}).
 
 %%--------------------------------------------------------------------
-send_response(ConnPid, StreamId, {Headers, Body}) ->
+get_sim_cfg(#{apns_json := JSON}) ->
+    pv(<<"sim_cfg">>, JSON, []).
+
+-compile({inline, [get_sim_cfg/1]}).
+
+%%--------------------------------------------------------------------
+send_response(ConnPid, StrmId, {Headers, Body}) ->
     {Opts, SendBody} = send_opts(Body),
-    h2_connection:send_headers(ConnPid, StreamId, Headers, Opts),
-    SendBody andalso h2_connection:send_body(ConnPid, StreamId, Body).
+    lager:debug("[StrId:~B] Sending headers:\n~p", [StrmId, Headers]),
+    h2_connection:send_headers(ConnPid, StrmId, Headers, Opts),
+    send_body(ConnPid, StrmId, SendBody, Body).
+
+%%--------------------------------------------------------------------
+send_body(ConnPid, StrmId, true, Body) ->
+    lager:debug("[StrId:~B] Sending body:\n~p", [StrmId, Body]),
+    h2_connection:send_body(ConnPid, StrmId, Body);
+send_body(_ConnPid, StrmId, false, Body) ->
+    lager:debug("[StrId:~B] NOT sending body=~p", [StrmId, Body]).
 
 %%--------------------------------------------------------------------
 send_opts(undefined) ->
@@ -319,8 +340,14 @@ check_apns_id_hdr(Headers) ->
 
 %%--------------------------------------------------------------------
 make_apns_id_hdr() ->
-    UUID = string:to_upper(binary_to_list(apns_lib_http2:make_uuid())),
-    {<<"apns-id">>, sc_util:to_bin(UUID)}.
+    {<<"apns-id">>, list_to_binary(
+                      string:to_upper(
+                        binary_to_list(apns_lib_http2:make_uuid())
+                       )
+                     )
+    }.
+
+-compile({inline, [make_apns_id_hdr/0]}).
 
 %%--------------------------------------------------------------------
 check_headers(Headers, Cert, JSON) ->
@@ -409,9 +436,13 @@ check_topic(<<ApnsTopic/binary>>, #{}=CertInfo) ->
 get_cert_topics(#{topics := Topics}) ->
     Topics.
 
+-compile({inline, [get_cert_topics/1]}).
+
 %%--------------------------------------------------------------------
 get_cert_subject_uid(#{subject_uid := Topic}) ->
     Topic.
+
+-compile({inline, [get_cert_subject_uid/1]}).
 
 %%--------------------------------------------------------------------
 get_default_topic(true = _IsMultTopics, _CertSubjUid) ->
@@ -420,6 +451,8 @@ get_default_topic(true = _IsMultTopics, _CertSubjUid) ->
 get_default_topic(false = _IsMultTopics, CertSubjUid) ->
     %% No topic provided and no multiple topics: use cert subject uid
     {CertSubjUid, undefined}.
+
+-compile({inline, [get_default_topic/2]}).
 
 %%--------------------------------------------------------------------
 get_topic_from_topics(Topic, Topics) when is_list(Topics) ->
@@ -482,12 +515,15 @@ check_content_available_key(10, _ContentAvailable, 1) ->
 check_content_available_key(Prio, _ContentAvailable, _KeyCount) ->
     {ok, Prio}.
 
+-compile({inline, [check_content_available_key/3]}).
+
 %%--------------------------------------------------------------------
 -spec reason(Rsn, RsnMap) -> Json when
       Rsn :: atom(), RsnMap :: map(), Json :: binary().
 reason(Rsn, RsnMap) when is_atom(Rsn) andalso is_map(RsnMap) ->
     maps:get(Rsn, RsnMap).
 
+-compile({inline, [reason/2]}).
 
 %%--------------------------------------------------------------------
 -spec status_hdr(Rsn, StsMap) -> Result when
@@ -504,6 +540,8 @@ status_hdr(Rsn, StsMap) when is_atom(Rsn) andalso is_map(StsMap) ->
                                                   atom_to_list(Rsn)])}])}
     end.
 
+-compile({inline, [status_hdr/2]}).
+
 
 %%--------------------------------------------------------------------
 encode_status_hdr({<<":status">>, Sts} = Val, Rsn) when is_binary(Sts),
@@ -512,11 +550,15 @@ encode_status_hdr({<<":status">>, Sts} = Val, Rsn) when is_binary(Sts),
                       {reason, list_to_binary(atom_to_list(Rsn))}
                      ] ++ maybe_ts(Sts))}.
 
+-compile({inline, [encode_status_hdr/2]}).
+
 %%--------------------------------------------------------------------
 maybe_ts(<<"410">>) ->
     [{timestamp, erlang:system_time(milli_seconds)}];
 maybe_ts(_) ->
     [].
+
+-compile({inline, [maybe_ts/1]}).
 
 %%--------------------------------------------------------------------
 response_from_reason(ReasonName, ExtraHdrs, S) when is_atom(ReasonName) ->
@@ -532,17 +574,20 @@ reason_for_status_code(Sts) ->
             'InternalServerError'
     end.
 
+-compile({inline, [reason_for_status_code/1]}).
+
 %%--------------------------------------------------------------------
 maybe_reason(success, _) ->
     undefined;
 maybe_reason(ReasonName, S) ->
     reason(ReasonName, S#?S.reasons).
 
+-compile({inline, [maybe_reason/2]}).
+
 %%--------------------------------------------------------------------
 -spec reasons() -> map().
 reasons() ->
     maps:from_list([{b2a(B), jsx:encode([{reason, B}])} || B <- reason_list()]).
-
 
 %%--------------------------------------------------------------------
 reason_list() ->
@@ -612,6 +657,8 @@ status_list() ->
 %%--------------------------------------------------------------------
 b2a(<<B/binary>>) ->
     list_to_atom(binary_to_list(B)).
+
+-compile({inline, [b2a/1]}).
 
 %%--------------------------------------------------------------------
 example_cert_info() ->
