@@ -83,18 +83,11 @@ init(ConnPid, StrmId) ->
 %%--------------------------------------------------------------------
 -spec on_receive_request_headers(Headers, State) -> Result when
       Headers :: h2_headers(), State :: state(), Result :: {ok, state()}.
-on_receive_request_headers(Headers, #?S{req=Req, stream=Strm}=State0) ->
+on_receive_request_headers(Headers, #?S{stream=Strm, req=Req}=State) ->
     lager:info("[StrId:~B] Hdrs: ~p\nReq: ~p", [Strm#stream.id, Headers, Req]),
-    State = case h2_connection:get_peercert(Strm#stream.conn_pid) of
-                {ok, PeerCertDer} ->
-                    PeerCert = apns_cert:der_decode_cert(PeerCertDer),
-                    PeerCertInfo = apns_cert:get_cert_info_map(PeerCert),
-                    State0#?S{req=Req#req{headers=Headers},
-                              peercert=PeerCertInfo};
-                {error, _} ->
-                    State0#?S{req=Req#req{headers=Headers}}
-            end,
-    {ok, State}.
+    {ok, State#?S{req=Req#req{headers=Headers},
+                  peercert=maybe_get_peercert_info(State#?S.peercert,
+                                                   Strm#stream.conn_pid)}}.
 
 %%--------------------------------------------------------------------
 on_send_push_promise(Headers, #?S{stream=Strm, req=Req}=State) ->
@@ -141,6 +134,22 @@ generate_push_promise_headers(Request, Path) ->
                      (_) -> false end, Request)
     ].
 
+
+%%--------------------------------------------------------------------
+maybe_get_peercert_info(undefined, ConnPid) ->
+    get_and_check_peercert(ConnPid);
+maybe_get_peercert_info(PeerCertInfo, _ConnPid) ->
+    PeerCertInfo.
+
+%%--------------------------------------------------------------------
+get_and_check_peercert(ConnPid) ->
+    case h2_connection:get_peercert(ConnPid) of
+        {ok, PeerCertDer} ->
+            PeerCert = apns_cert:der_decode_cert(PeerCertDer),
+            apns_cert:get_cert_info_map(PeerCert);
+        {error, _} ->
+            undefined
+    end.
 
 %%--------------------------------------------------------------------
 handle_request(Method, Path, Headers, #?S{stream=#stream{id=SID,
