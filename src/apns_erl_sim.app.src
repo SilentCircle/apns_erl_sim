@@ -2,7 +2,9 @@
  [{description, "An APNS HTTP/2 simulator"},
   {vsn, "0.1.0"},
   {registered, [apns_erl_sim,
-                apns_erl_sim_sup]},
+                apns_erl_sim_auth_cache,
+                apns_erl_sim_sup
+               ]},
   {mod, { apns_erl_sim_app, []}},
   {applications,
    [kernel,
@@ -25,6 +27,7 @@
    ]},
   {modules, [
              apns_erl_sim,
+             apns_erl_sim_auth_cache,
              apns_erl_sim_app,
              apns_erl_sim_stream,
              apns_erl_sim_sup

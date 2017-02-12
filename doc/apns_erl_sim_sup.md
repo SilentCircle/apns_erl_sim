@@ -25,11 +25,11 @@ __Behaviours:__ [`supervisor`](supervisor.md).
 
 ### init/1 ###
 
-`init(Options) -> any()`
+`init(X1) -> any()`
 
 <a name="start_link-1"></a>
 
 ### start_link/1 ###
 
-`start_link(Options) -> any()`
+`start_link(Arg) -> any()`
 

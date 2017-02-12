@@ -38,6 +38,12 @@
 %%% Defines
 %%%====================================================================
 -define(MAX_PAYLOAD, 4096).
+-define(MAX_CONCURRENT_STREAMS, 500).
+-define(MIN_CONCURRENT_STREAMS, 1).
+-define(JWT_EXPIRY, 3600). % 1 hour past iat
+
+-define(UUID_RE, "^[[:xdigit:]]{8}(?:-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$").
+
 -define(S, ?MODULE).
 
 %%%====================================================================
@@ -49,24 +55,30 @@
 
 -record(req, {
           headers = []   :: h2_headers(),
-          data    = <<>> :: h2_data()
+          data    = <<>> :: h2_data(),
+          map     = #{}  :: map()
          }).
 
 -type req_rec() :: #req{}.
 
 -record(stream, {
-          conn_pid :: pid(),
-          id       :: stream_id()
+          conn_pid  :: pid(),
+          id        :: stream_id()
          }).
 
 -type stream_rec() :: #stream{}.
 
+-type ec_private_key() :: #'ECPrivateKey'{}.
+
 -record(?S, {
-           req      = #req{} :: req_rec(),
-           stream   = #stream{} :: stream_rec(),
-           reasons  = reasons() :: map(),
-           sts_hdrs = status_hdrs() :: map(),
-           peercert = undefined :: undefined | map()
+           req                    = #req{} :: req_rec(),
+           stream                 = #stream{} :: stream_rec(),
+           peercert               = undefined :: undefined | none | map(),
+           mcs_changed            = false :: boolean(),
+           %% These don't change once assigned
+           uuid_re                = undefined :: undefined | re:mp(),
+           reasons                = reasons() :: map(),
+           sts_hdrs               = status_hdrs() :: map()
           }).
 
 -type state() :: #?S{}.
@@ -74,20 +86,61 @@
 %%%====================================================================
 %%% h2_stream callback functions
 %%%====================================================================
+%% Warning: There cannot be any calls to h2_connection etc in this
+%% function, because it causes a deadlock.
 -spec init(ConnPid, StrmId) -> Result when
       ConnPid :: pid(), StrmId :: stream_id(), Result :: {ok, state()}.
 init(ConnPid, StrmId) ->
-    %% You need to pull settings here from application:env or something
-    {ok, make_state(ConnPid, StrmId)}.
+    State = make_state(ConnPid, StrmId),
+    {ok, State}.
 
 %%--------------------------------------------------------------------
 -spec on_receive_request_headers(Headers, State) -> Result when
       Headers :: h2_headers(), State :: state(), Result :: {ok, state()}.
-on_receive_request_headers(Headers, #?S{stream=Strm, req=Req}=State) ->
+on_receive_request_headers(Headers, #?S{stream=#stream{id=StrmId,
+                                                       conn_pid=ConnPid},
+                                        peercert=undefined, % First time
+                                        mcs_changed=MCSChanged0}=State) ->
+    {MCSCh, PeerCert} = case get_and_check_peercert(ConnPid) of
+                            undefined ->
+                                lager:debug("[StrId:~B] Using token-based auth",
+                                            [StrmId]),
+                                {MCSChanged0, none};
+                            Cert ->
+                                lager:debug("[StrId:~B] Using cert-based auth",
+                                            [StrmId]),
+                                ok = change_MCS(?MAX_CONCURRENT_STREAMS,
+                                                ConnPid),
+                                {true, Cert}
+                        end,
+    handle_request_headers(Headers, State#?S{peercert=PeerCert,
+                                             mcs_changed=MCSCh});
+on_receive_request_headers(Headers, State) ->
+    handle_request_headers(Headers, State).
+
+%%--------------------------------------------------------------------
+handle_request_headers(Headers, #?S{stream=#stream{conn_pid=ConnPid}=Strm,
+                                    req=Req,
+                                    peercert=none,
+                                    mcs_changed=MCSChanged0}=State) ->
     lager:info("[StrId:~B] Hdrs: ~p\nReq: ~p", [Strm#stream.id, Headers, Req]),
-    {ok, State#?S{req=Req#req{headers=Headers},
-                  peercert=maybe_get_peercert_info(State#?S.peercert,
-                                                   Strm#stream.conn_pid)}}.
+    MCSChanged = case check_jwt_auth(Headers) of
+                     {ok, changed} when not MCSChanged0 ->
+                         ok = change_MCS(?MAX_CONCURRENT_STREAMS, ConnPid),
+                         true;
+                     {ok, Status} when Status =:= changed orelse
+                                       Status =:= cached ->
+                         MCSChanged0
+                 end,
+    ReqMap = check_headers(Headers, undefined, State#?S.uuid_re),
+    {ok, State#?S{req=Req#req{headers=Headers, map=ReqMap},
+                  mcs_changed=MCSChanged}};
+handle_request_headers(Headers, #?S{stream=#stream{id=StrmId},
+                                    req=Req,
+                                    peercert=PCI}=State) ->
+    lager:info("[StrId:~B] Hdrs: ~p\nReq: ~p", [StrmId, Headers, Req]),
+    ReqMap = check_headers(Headers, PCI, State#?S.uuid_re),
+    {ok, State#?S{req=Req#req{headers=Headers, map=ReqMap}}}.
 
 %%--------------------------------------------------------------------
 on_send_push_promise(Headers, #?S{stream=Strm, req=Req}=State) ->
@@ -108,11 +161,11 @@ on_receive_request_data(Bin, #?S{stream=Strm, req=#req{data=Data}=Req}=State) ->
 on_request_end_stream(#?S{stream=#stream{id=StrmId}, req=Req} = State) ->
     lager:info("[StrId:~B] Req: ~p", [StrmId, Req]),
     Headers = Req#req.headers,
-    Method = proplists:get_value(<<":method">>, Headers),
-    Path = binary_to_list(proplists:get_value(<<":path">>, Headers)),
+    Method = pv(<<":method">>, Headers),
+    Path = binary_to_list(pv(<<":path">>, Headers)),
 
     lager:debug("[StrId:~B] method:~s path:~s", [StrmId, Method, Path]),
-    handle_request(Method, Path, Headers, State),
+    handle_request(Method, Path, State),
     {ok, State#?S{req=#req{}}}. % Be paranoid and clear req data
 
 
@@ -122,7 +175,10 @@ on_request_end_stream(#?S{stream=#stream{id=StrmId}, req=Req} = State) ->
 
 %%--------------------------------------------------------------------
 make_state(ConnPid, StrmId) ->
-    #?S{stream = #stream{conn_pid = ConnPid, id = StrmId}}.
+    {ok, RE} = re:compile(?UUID_RE),
+    #?S{uuid_re=RE,
+        stream=#stream{conn_pid=ConnPid, id=StrmId}}.
+
 
 %%--------------------------------------------------------------------
 -spec generate_push_promise_headers(hpack:headers(), binary()) -> hpack:headers().
@@ -136,10 +192,9 @@ generate_push_promise_headers(Request, Path) ->
 
 
 %%--------------------------------------------------------------------
-maybe_get_peercert_info(undefined, ConnPid) ->
-    get_and_check_peercert(ConnPid);
-maybe_get_peercert_info(PeerCertInfo, _ConnPid) ->
-    PeerCertInfo.
+change_MCS(MCS, ConnPid) ->
+    Settings = #settings{max_concurrent_streams=MCS},
+    h2_connection:update_settings(ConnPid, Settings).
 
 %%--------------------------------------------------------------------
 get_and_check_peercert(ConnPid) ->
@@ -152,47 +207,50 @@ get_and_check_peercert(ConnPid) ->
     end.
 
 %%--------------------------------------------------------------------
-handle_request(Method, Path, Headers, #?S{stream=#stream{id=SID,
-                                                         conn_pid=CID}}=St) ->
-    Rsp = make_response(Method, Path, Headers, St),
+handle_request(Method, Path, #?S{stream=#stream{id=SID,
+                                                conn_pid=CID}}=St) ->
+    Rsp = make_response(Method, Path, St),
     lager:debug("[StrId:~B] sending response ~p", [SID, Rsp]),
     send_response(CID, SID, Rsp).
 
 
 %%--------------------------------------------------------------------
-make_response(<<"POST">>, "/3/device/" ++ Token, Headers, #?S{} = State) ->
-    handle_post(Headers, Token, State);
-make_response(<<"POST">>, _Other, Headers, #?S{}=S) ->
-    response_from_reason('BadPath', [apns_id_hdr(Headers)], S);
-make_response(_, _Other, Headers,  #?S{}=S) ->
-    response_from_reason('MethodNotAllowed', [apns_id_hdr(Headers)], S).
+make_response(<<"POST">>, "/3/device/" ++ Token, #?S{} = State) ->
+    handle_post(Token, State);
+make_response(<<"POST">>, _Other, #?S{uuid_re=RE,
+                                      req=#req{headers=Headers}}=S) ->
+    response_from_reason('BadPath', [apns_id_hdr(Headers, RE)], S);
+make_response(_, _Other, #?S{uuid_re=RE,
+                             req=#req{headers=Headers}}=S) ->
+    response_from_reason('MethodNotAllowed', [apns_id_hdr(Headers, RE)], S).
 
 
 %%--------------------------------------------------------------------
-handle_post(Headers, Token, #?S{req=#req{data=Payload},
-                                stream=#stream{id=StrmId},
-                                peercert=Cert}=S) ->
+handle_post(Token, #?S{uuid_re=RE,
+                       req=#req{headers=Headers, data=Payload, map=ReqMap0},
+                       stream=#stream{id=StrmId},
+                       peercert=Cert}=S) ->
     lager:debug("[StrId:~B]\nReq: ~p\nCert: ~p", [StrmId, S#?S.req, Cert]),
     try
-        ApnsIdHdr = case check_apns_id_hdr(Headers) of
-                        {ok, Hdr} ->
-                            Hdr;
-                        {BadApnsId, Hdr} ->
-                            throw({status_with_apns_id, {BadApnsId, Hdr}})
-                    end,
+        ApnsIdHdr = check_apns_id_hdr(Headers, RE),
         RespHdrs = [ApnsIdHdr],
-        check_token(Token),
+        check_apns_token(Token),
+        Prio0 = pv(<<"apns-priority">>, Headers),
         JSON = check_payload(Payload),
-        ReqMap = check_headers(Headers, Cert, JSON),
+        APS = pv(<<"aps">>, JSON, []),
+        {ok, Prio} = check_body(APS, Prio0),
+        ReqMap = ReqMap0#{apns_priority => Prio,
+                          apns_json => JSON,
+                          apns_aps_dict => APS},
         lager:info("[StrId:~B]\nJSON: ~p\nReqMap: ~p", [StrmId, JSON, ReqMap]),
         handle_req_map(ReqMap, RespHdrs, S)
     catch
         error:{badmatch, Status} ->
-            response_from_reason(Status, [apns_id_hdr(Headers)], S);
+            response_from_reason(Status, [apns_id_hdr(Headers, RE)], S);
         throw:{status_with_apns_id, {Status, IdHdr}} ->
             response_from_reason(Status, [IdHdr], S);
         throw:{status, Status} ->
-            response_from_reason(Status, [apns_id_hdr(Headers)], S)
+            response_from_reason(Status, [apns_id_hdr(Headers, RE)], S)
     end.
 
 %%--------------------------------------------------------------------
@@ -216,13 +274,26 @@ sleep(Ms) ->
     receive after Ms -> ok end.
 
 %%--------------------------------------------------------------------
+pv(K, Cfg) ->
+    pv(K, Cfg, undefined).
+
+%%--------------------------------------------------------------------
 pv(K, Cfg, Default) ->
     case lists:keyfind(K, 1, Cfg) of
         {_, V} -> V;
         false  -> Default
     end.
 
--compile({inline, [pv/3]}).
+-compile({inline, [pv/2, pv/3]}).
+
+%%--------------------------------------------------------------------
+assert_pv(Key, Props, Exception) ->
+    case pv(Key, Props) of
+        undefined ->
+            throw(Exception);
+        Value ->
+            Value
+    end.
 
 %%--------------------------------------------------------------------
 -define(sim_status_code(Cfg), sc_util:to_bin(pv(<<"status_code">>, Cfg, <<>>))).
@@ -323,28 +394,27 @@ send_opts(_) ->
     {[], true}.
 
 %%--------------------------------------------------------------------
--spec apns_id_hdr(Headers) -> Result when
-      Headers :: h2_headers(), Result :: h2_header().
-apns_id_hdr(Headers) ->
-    {_, Hdr} = check_apns_id_hdr(Headers),
+-spec apns_id_hdr(Headers, RE) -> Result when
+      Headers :: h2_headers(), RE :: re:mp(), Result :: h2_header().
+apns_id_hdr(Headers, RE) ->
+    {_, Hdr} = check_apns_id_hdr(Headers, RE),
     Hdr.
 
 %%--------------------------------------------------------------------
--define(UUID_RE, "^[[:xdigit:]]{8}(?:-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$").
-
--spec check_apns_id_hdr(Headers) -> Result when
-      Headers :: h2_headers(), Result :: {ok | 'BadMessageId', h2_header()}.
-check_apns_id_hdr(Headers) ->
+-spec check_apns_id_hdr(Headers, RE) -> Result when
+      Headers :: h2_headers(), RE :: re:mp(),
+      Result :: {ok | 'BadMessageId', h2_header()}.
+check_apns_id_hdr(Headers, RE) ->
     case lists:keyfind(<<"apns-id">>, 1, Headers) of
         {<<"apns-id">>, UUID} = Hdr ->
-            case re:run(binary_to_list(UUID), ?UUID_RE, [{capture, none}]) of
+            case re:run(binary_to_list(UUID), RE, [{capture, none}]) of
                 match ->
-                    {ok, Hdr};
+                    Hdr;
                 nomatch ->
-                    {'BadMessageId', make_apns_id_hdr()}
+                    throw({status, 'BadMessageId'})
             end;
         false ->
-            {ok, make_apns_id_hdr()}
+            make_apns_id_hdr()
     end.
 
 %%--------------------------------------------------------------------
@@ -359,32 +429,34 @@ make_apns_id_hdr() ->
 -compile({inline, [make_apns_id_hdr/0]}).
 
 %%--------------------------------------------------------------------
-check_headers(Headers, Cert, JSON) ->
+-spec check_headers(Headers, Cert, RE) -> Result when
+      Headers :: h2_headers(), Cert :: undefined | map(), RE :: re:mp(),
+      Result :: map().
+check_headers(Headers, Cert, RE) ->
     %RespHdrs = [apns_id_hdr(Headers)],
-    UUID = apns_id_hdr(Headers),
+    Topic0 = pv(<<"apns-topic">>, Headers),
+    {Topic, App} = check_topic(Topic0, Cert),
+    UUID = apns_id_hdr(Headers, RE),
+    Exp0 = pv(<<"apns-expiration">>, Headers),
+    {ok, Exp} = check_expiration(Exp0),
 
-    Topic = proplists:get_value(<<"apns-topic">>, Headers),
-    {UseTopic, App} = check_topic(Topic, Cert),
-
-    Exp = proplists:get_value(<<"apns-expiration">>, Headers),
-    {ok, UseExp} = check_expiration(Exp),
-
-    Prio = proplists:get_value(<<"apns-priority">>, Headers),
-    APS = proplists:get_value(<<"aps">>, JSON, []),
-    ContentAvailable = proplists:get_value(<<"content-available">>, APS),
-    Count = length(APS),
-    {ok, UsePrio} = check_priority(Prio, ContentAvailable, Count),
-
-    #{apns_topic => UseTopic,
-      apns_expiration => UseExp,
-      apns_priority => UsePrio,
-      apns_json => JSON,
-      apns_aps_dict => APS,
+    #{apns_topic => Topic,
+      apns_expiration => Exp,
       apns_id => UUID,
       cert_app => App}.
 
 %%--------------------------------------------------------------------
-check_token(Token) ->
+-spec check_body(APS, Prio) -> Result when
+      APS :: jsx:json_term(), Prio :: undefined | non_neg_integer(),
+      Result :: {ok, Priority},
+      Priority :: non_neg_integer().
+check_body(APS, Prio) ->
+    ContentAvailable = pv(<<"content-available">>, APS),
+    Count = length(APS),
+    check_priority(Prio, ContentAvailable, Count).
+
+%%--------------------------------------------------------------------
+check_apns_token(Token) ->
     try
         32 = byte_size(sc_util:hex_to_bitstring(Token))
     catch
@@ -410,6 +482,91 @@ check_payload(Payload) ->
 
 
 %%--------------------------------------------------------------------
+%% Verify the JWT
+%%--------------------------------------------------------------------
+check_jwt_auth(Headers) ->
+    Auth = assert_pv(<<"authorization">>, Headers,
+                     {status, 'MissingProviderToken'}),
+    Topic = assert_pv(<<"apns-topic">>, Headers,
+                      {status, 'MissingTopic'}),
+    JWT = extract_auth_token(Auth),
+    DecodedJWT = apns_jwt:decode_jwt(JWT),
+    case apns_erl_sim_auth_cache:validate_jwt(JWT) of
+        ok ->
+            {ok, {cached, JWT}};
+        {error, _} ->
+            Key = get_key_for_jwt(DecodedJWT, Topic),
+            case verify_jwt(DecodedJWT, Topic, Key) of
+                ok ->
+                    apns_erl_sim_auth_cache:add_auth({jwt, JWT, ?JWT_EXPIRY}),
+                    {ok, {changed, JWT}};
+                {error, Status}=Error when is_atom(Status) ->
+                    throw(Error)
+            end
+    end.
+
+%%--------------------------------------------------------------------
+extract_auth_token(<<BBearer:6/binary, $\s, JWT/binary>>) ->
+    case string:to_lower(binary_to_list(BBearer)) of
+        "bearer" ->
+             JWT;
+        _ ->
+            throw({status, 'InvalidProviderToken'})
+    end;
+extract_auth_token(_Auth) ->
+    throw({status, 'InvalidProviderToken'}).
+
+%%--------------------------------------------------------------------
+-spec get_key_for_jwt({Hdr, Payl, Sig, SigInput}, Topic) -> Result when
+      Hdr :: jsx:json_term(), Payl :: jsx:json_term(), Sig :: binary(),
+      SigInput :: binary(), Topic :: binary(), Result :: ec_private_key().
+get_key_for_jwt({Hdr, Payl, _, _}, Topic) ->
+    Kid = assert_pv(<<"kid">>, Hdr, {status, 'InvalidProviderToken'}),
+    Iss = assert_pv(<<"iss">>, Payl, {status, 'InvalidProviderToken'}),
+    case apns_erl_sim:get_key(Kid, Iss, Topic) of
+        {ok, Key} ->
+            Key;
+        {error, _} ->
+            throw({status, 'InvalidProviderToken'})
+    end.
+
+%%--------------------------------------------------------------------
+%% @private
+-spec verify_jwt({Hdr, Payl, Sig, SigInput}, Topic, Key) -> Result when
+      Hdr :: jsx:json_term(), Payl :: jsx:json_term(), Sig :: binary(),
+      SigInput :: binary(), Topic :: binary(), Key :: ec_private_key(),
+      Result :: ok
+              | {error, 'InvalidProviderToken'}
+              | {error, 'ExpiredProviderToken'}.
+verify_jwt({Hdr, _Payl, _Sig, _SigInput}=DecodedJWT, <<Topic/binary>>, Key) ->
+    Kid = assert_pv(<<"kid">>, Hdr, {status, 'InvalidProviderToken'}),
+    %% We use Topic for the ctx because verify_jwt will check
+    %% iss against it. If we used iss, we would be checking it against
+    %% itself.
+    Ctx = apns_jwt:new(Kid, Topic, Key),
+    case apns_jwt:verify_jwt(DecodedJWT, Ctx) of
+        ok ->
+            ok;
+        {error, Error} ->
+            lager:error("Error verifying jwt: ~p", [Error]),
+            convert_verify_jwt_error(Error)
+    end.
+
+%%--------------------------------------------------------------------
+%% @private
+convert_verify_jwt_error({missing_keys, [_|_], bad_items, _}) ->
+    {error, 'InvalidProviderToken'};
+convert_verify_jwt_error({missing_keys, _, bad_items, L}) ->
+    case pv(<<"iat">>, L) of
+        Iat when is_integer(Iat) ->
+            {error, 'ExpiredProviderToken'};
+        _ ->
+            {error, 'InvalidProviderToken'}
+    end;
+convert_verify_jwt_error(_) ->
+    {error, 'InvalidProviderToken'}.
+
+%%--------------------------------------------------------------------
 -spec check_topic(ApnsTopic, CertInfo) -> Result when
       ApnsTopic :: undefined | binary(), CertInfo :: undefined | map(),
       Result :: 'BadCertificate'
@@ -421,7 +578,7 @@ check_topic(undefined, undefined) ->
     'MissingTopic';
 check_topic(<<ApnsTopic/binary>>, undefined) ->
     {ApnsTopic, undefined};
-check_topic(<<ApnsTopic/binary>>, #{}=CertInfo) ->
+check_topic(ApnsTopic, #{}=CertInfo) ->
     Topics = get_cert_topics(CertInfo),
     IsMultTopics = is_list(Topics),
     CertSubjUid = get_cert_subject_uid(CertInfo),
@@ -603,6 +760,7 @@ reason_list() ->
     [
      <<"BadCertificate">>,
      <<"BadCertificateEnvironment">>,
+     <<"BadCollapseId">>,
      <<"BadDeviceToken">>,
      <<"BadExpirationDate">>,
      <<"BadMessageId">>,
@@ -611,16 +769,20 @@ reason_list() ->
      <<"BadTopic">>,
      <<"DeviceTokenNotForTopic">>,
      <<"DuplicateHeaders">>,
+     <<"ExpiredProviderToken">>,
      <<"Forbidden">>,
      <<"IdleTimeout">>,
      <<"InternalServerError">>,
+     <<"InvalidProviderToken">>,
      <<"MethodNotAllowed">>,
      <<"MissingDeviceToken">>,
+     <<"MissingProviderToken">>,
      <<"MissingTopic">>,
      <<"PayloadEmpty">>,
      <<"PayloadTooLarge">>,
      <<"ServiceUnavailable">>,
      <<"Shutdown">>,
+     <<"TooManyProviderTokenUpdates">>,
      <<"TooManyRequests">>,
      <<"TopicDisallowed">>,
      <<"Unregistered">>
@@ -636,30 +798,44 @@ status_hdrs() ->
 %%--------------------------------------------------------------------
 status_list() ->
     [
-     {'BadCertificate',             <<"403">>},
-     {'BadCertificateEnvironment',  <<"403">>},
-     {'BadDeviceToken',             <<"400">>},
-     {'BadExpirationDate',          <<"400">>},
-     {'BadMessageId',               <<"400">>},
-     {'BadPath',                    <<"400">>},
-     {'BadPriority',                <<"400">>},
-     {'BadTopic',                   <<"400">>},
-     {'DeviceTokenNotForTopic',     <<"400">>},
-     {'DuplicateHeaders',           <<"400">>},
-     {'Forbidden',                  <<"400">>},
-     {'IdleTimeout',                <<"503">>},
-     {'InternalServerError',        <<"500">>},
-     {'MethodNotAllowed',           <<"405">>},
-     {'MissingDeviceToken',         <<"400">>},
-     {'MissingTopic',               <<"400">>},
-     {'PayloadEmpty',               <<"400">>},
-     {'PayloadTooLarge',            <<"413">>},
-     {'ServiceUnavailable',         <<"503">>},
-     {'Shutdown',                   <<"503">>},
-     {'TooManyRequests',            <<"429">>},
-     {'TopicDisallowed',            <<"400">>},
-     {'Unregistered',               <<"410">>},
-     {success,                      <<"200">>}
+     {'BadCollapseId',                  <<"400">>},
+     {'BadDeviceToken',                 <<"400">>},
+     {'BadExpirationDate',              <<"400">>},
+     {'BadMessageId',                   <<"400">>},
+     {'BadPriority',                    <<"400">>},
+     {'BadTopic',                       <<"400">>},
+     {'DeviceTokenNotForTopic',         <<"400">>},
+     {'DuplicateHeaders',               <<"400">>},
+     {'IdleTimeout',                    <<"400">>},
+     {'MissingDeviceToken',             <<"400">>},
+     {'MissingTopic',                   <<"400">>},
+     {'PayloadEmpty',                   <<"400">>},
+     {'TopicDisallowed',                <<"400">>},
+
+     {'BadCertificate',                 <<"403">>},
+     {'BadCertificateEnvironment',      <<"403">>},
+     {'ExpiredProviderToken',           <<"403">>},
+     {'Forbidden',                      <<"403">>},
+     {'InvalidProviderToken',           <<"403">>},
+     {'MissingProviderToken',           <<"403">>},
+
+     {'BadPath',                        <<"404">>},
+
+     {'MethodNotAllowed',               <<"405">>},
+
+     {'Unregistered',                   <<"410">>},
+
+     {'PayloadTooLarge',                <<"413">>},
+
+     {'TooManyProviderTokenUpdates',    <<"429">>},
+     {'TooManyRequests',                <<"429">>},
+
+     {'InternalServerError',            <<"500">>},
+
+     {'ServiceUnavailable',             <<"503">>},
+     {'Shutdown',                       <<"503">>},
+
+     {success,                          <<"200">>}
     ].
 
 

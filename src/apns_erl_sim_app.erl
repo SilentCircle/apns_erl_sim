@@ -31,7 +31,7 @@
 %%====================================================================
 
 start(_StartType, _StartArgs) ->
-    setup_env(),
+    Http2Settings = setup_env(),
     RanchTcpProto = case application:get_env(chatterbox, ssl) of
                         {ok, true} -> ranch_ssl;
                         _          -> ranch_tcp
@@ -39,7 +39,7 @@ start(_StartType, _StartArgs) ->
     Options = case application:get_env(chatterbox, ssl_options) of
                   {ok, SslOpts} -> SslOpts;
                   _             -> default_options(RanchTcpProto)
-              end,
+              end ++ [{http2_settings, Http2Settings}],
     apns_erl_sim_sup:start_link({RanchTcpProto, Options}).
 
 %%--------------------------------------------------------------------
@@ -51,7 +51,12 @@ stop(_State) ->
 %%====================================================================
 
 setup_env() ->
-    application:set_env(chatterbox, stream_callback_mod, apns_erl_sim_stream).
+    Settings = apns_erl_sim:settings(),
+    application:set_env(chatterbox, stream_callback_mod, apns_erl_sim_stream),
+    %% APNS servers always start off with MCS == 1 until after authentication,
+    %% after which they (at time of writing) increase to 500.
+    application:set_env(chatterbox, server_max_concurrent_streams, 1),
+    Settings.
 
 %% Set up default socket options
 default_options(ranch_tcp) ->
@@ -70,4 +75,3 @@ default_options(ranch_ssl) ->
      {fail_if_no_peer_cert, true},
      {next_protocols_advertised, [<<"h2">>]}
     ].
-

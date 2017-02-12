@@ -30,15 +30,15 @@
 -export([init/1]).
 
 -define(SERVER, ?MODULE).
--define(NUM_ACCEPTORS, 100). % Ranch acceptors
+-define(NUM_ACCEPTORS, 10). % Ranch acceptors
 
 %%====================================================================
 %% API functions
 %%====================================================================
 
 start_link({TcpProto, Options}=Arg) when (TcpProto == ranch_ssl orelse
-                                          TcpProto == ranch_tcp) andalso
-                                         is_list(Options) ->
+                                          TcpProto == ranch_tcp)
+                                         andalso is_list(Options) ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, Arg).
 
 %%====================================================================
@@ -63,8 +63,17 @@ init({RanchTcpProto, Options}) when (RanchTcpProto == ranch_ssl orelse
                                     chatterbox_ranch_protocol,
                                     []),
 
+    CacheSpec = #{id       => apns_erl_sim_auth_cache,
+                  start    => {apns_erl_sim_auth_cache, start_link, []},
+                  restart  => permanent,
+                  shutdown => 5000,
+                  type     => worker,
+                  modules  => [apns_erl_sim_auth_cache]},
+
+    SimOpts = [{jwt_key_path, get_jwt_keypath()}],
+
     SimSpec = #{id       => apns_erl_sim,
-                start    => {apns_erl_sim, start_link, []},
+                start    => {apns_erl_sim, start_link, [SimOpts]},
                 restart  => permanent,
                 shutdown => 5000,
                 type     => worker,
@@ -72,6 +81,7 @@ init({RanchTcpProto, Options}) when (RanchTcpProto == ranch_ssl orelse
 
     Children = [
                 RanchSupSpec,
+                CacheSpec,
                 SimSpec,
                 ListenerSpec
                ],
@@ -85,3 +95,7 @@ init({RanchTcpProto, Options}) when (RanchTcpProto == ranch_ssl orelse
 %%====================================================================
 %% Internal functions
 %%====================================================================
+get_jwt_keypath() ->
+    {ok, App} = application:get_application(?MODULE),
+    application:get_env(App, jwt_key_path).
+
