@@ -30,7 +30,7 @@
 -export([init/1]).
 
 -define(SERVER, ?MODULE).
--define(NUM_ACCEPTORS, 10). % Ranch acceptors
+-define(NUM_ACCEPTORS, 100). % Ranch acceptors
 
 %%====================================================================
 %% API functions
@@ -56,11 +56,11 @@ init({RanchTcpProto, Options}) when (RanchTcpProto == ranch_ssl orelse
                      type     => supervisor,
                      modules  => [ranch_sup]},
 
-    ListenerSpec = ranch:child_spec(chatterbox_ranch_protocol,
+    ListenerSpec = ranch:child_spec(apns_erl_sim_ranch_protocol,
                                     ?NUM_ACCEPTORS,
                                     RanchTcpProto,
                                     Options,
-                                    chatterbox_ranch_protocol,
+                                    apns_erl_sim_ranch_protocol,
                                     []),
 
     CacheSpec = #{id       => apns_erl_sim_auth_cache,

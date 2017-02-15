@@ -99,48 +99,21 @@ init(ConnPid, StrmId) ->
       Headers :: h2_headers(), State :: state(), Result :: {ok, state()}.
 on_receive_request_headers(Headers, #?S{stream=#stream{id=StrmId,
                                                        conn_pid=ConnPid},
-                                        peercert=undefined, % First time
-                                        mcs_changed=MCSChanged0}=State) ->
-    {MCSCh, PeerCert} = case get_and_check_peercert(ConnPid) of
-                            undefined ->
-                                lager:debug("[StrId:~B] Using token-based auth",
-                                            [StrmId]),
-                                {MCSChanged0, none};
-                            Cert ->
-                                lager:debug("[StrId:~B] Using cert-based auth",
-                                            [StrmId]),
-                                ok = change_MCS(?MAX_CONCURRENT_STREAMS,
-                                                ConnPid),
-                                {true, Cert}
-                        end,
-    handle_request_headers(Headers, State#?S{peercert=PeerCert,
-                                             mcs_changed=MCSCh});
+                                        peercert=undefined % First time
+                                       }=State) ->
+    PeerCert = case get_and_check_peercert(ConnPid) of
+                   undefined ->
+                       lager:debug("[StrId:~B] Using token-based auth",
+                                   [StrmId]),
+                       none;
+                   Cert ->
+                       lager:debug("[StrId:~B] Using cert-based auth",
+                                   [StrmId]),
+                       Cert
+               end,
+    handle_request_headers(Headers, State#?S{peercert=PeerCert});
 on_receive_request_headers(Headers, State) ->
     handle_request_headers(Headers, State).
-
-%%--------------------------------------------------------------------
-handle_request_headers(Headers, #?S{stream=#stream{conn_pid=ConnPid}=Strm,
-                                    req=Req,
-                                    peercert=none,
-                                    mcs_changed=MCSChanged0}=State) ->
-    lager:info("[StrId:~B] Hdrs: ~p\nReq: ~p", [Strm#stream.id, Headers, Req]),
-    MCSChanged = case check_jwt_auth(Headers) of
-                     {ok, changed} when not MCSChanged0 ->
-                         ok = change_MCS(?MAX_CONCURRENT_STREAMS, ConnPid),
-                         true;
-                     {ok, Status} when Status =:= changed orelse
-                                       Status =:= cached ->
-                         MCSChanged0
-                 end,
-    ReqMap = check_headers(Headers, undefined, State#?S.uuid_re),
-    {ok, State#?S{req=Req#req{headers=Headers, map=ReqMap},
-                  mcs_changed=MCSChanged}};
-handle_request_headers(Headers, #?S{stream=#stream{id=StrmId},
-                                    req=Req,
-                                    peercert=PCI}=State) ->
-    lager:info("[StrId:~B] Hdrs: ~p\nReq: ~p", [StrmId, Headers, Req]),
-    ReqMap = check_headers(Headers, PCI, State#?S.uuid_re),
-    {ok, State#?S{req=Req#req{headers=Headers, map=ReqMap}}}.
 
 %%--------------------------------------------------------------------
 on_send_push_promise(Headers, #?S{stream=Strm, req=Req}=State) ->
@@ -192,6 +165,61 @@ generate_push_promise_headers(Request, Path) ->
 
 
 %%--------------------------------------------------------------------
+handle_request_headers(Headers, #?S{uuid_re=RE}=S) ->
+    Res = try
+              handle_request_headers_nocatch(Headers, S)
+          catch
+              error:{badmatch, Status} ->
+                  response_from_reason(Status, [apns_id_hdr(Headers, RE)], S);
+              throw:{status_with_apns_id, {Status, IdHdr}} ->
+                  response_from_reason(Status, [IdHdr], S);
+              throw:{status, Status} ->
+                  response_from_reason(Status, [apns_id_hdr(Headers, RE)], S)
+          end,
+    case Res of
+        {ok, #?S{}=_NewState} ->
+            Res;
+        {_Headers, _Body}=Resp ->
+            #?S{stream=#stream{conn_pid=CID, id=SID}}=S,
+            send_response(CID, SID, Resp),
+            {ok, S}
+    end.
+
+%%--------------------------------------------------------------------
+handle_request_headers_nocatch(Headers, #?S{uuid_re=RE,
+                                            req=Req,
+                                            stream=#stream{conn_pid=CID,
+                                                           id=SID},
+                                            peercert=none, % Not cert-based
+                                            mcs_changed=MCSCh}=State) ->
+    lager:info("[StrId:~B] Hdrs: ~p\nReq: ~p", [SID, Headers, Req]),
+    case check_jwt_auth(Headers) of
+        {ok, Status} ->
+            ReqMap = check_headers(Headers, undefined, RE),
+            {ok, State#?S{req=Req#req{headers=Headers, map=ReqMap},
+                          mcs_changed=maybe_maximize_mcs(CID, Status, MCSCh)}};
+
+        {error, Status} when is_atom(Status) ->
+            Resp = response_from_reason(Status, [apns_id_hdr(Headers, RE)], State),
+            send_response(CID, SID, Resp),
+            {ok, State}
+    end;
+handle_request_headers_nocatch(Headers, #?S{stream=#stream{id=StrmId},
+                                            req=Req,
+                                            peercert=PCI}=State) ->
+    lager:info("[StrId:~B] Hdrs: ~p\nReq: ~p", [StrmId, Headers, Req]),
+    ReqMap = check_headers(Headers, PCI, State#?S.uuid_re),
+    {ok, State#?S{req=Req#req{headers=Headers, map=ReqMap}}}.
+
+%%--------------------------------------------------------------------
+maybe_maximize_mcs(CID, changed=_Status, false=_MCSChanged) ->
+    ok = change_MCS(?MAX_CONCURRENT_STREAMS, CID),
+    true;
+maybe_maximize_mcs(_CID, Status, MCSChanged) when Status =:= changed orelse
+                                                  Status =:= cached ->
+    MCSChanged.
+
+%%--------------------------------------------------------------------
 change_MCS(MCS, ConnPid) ->
     Settings = #settings{max_concurrent_streams=MCS},
     h2_connection:update_settings(ConnPid, Settings).
@@ -213,8 +241,11 @@ handle_request(Method, Path, #?S{stream=#stream{id=SID,
     lager:debug("[StrId:~B] sending response ~p", [SID, Rsp]),
     send_response(CID, SID, Rsp).
 
-
 %%--------------------------------------------------------------------
+-spec make_response(Method, Path, State) -> Result when
+      Method :: binary(), Path :: string(), State :: state(),
+      Result :: {Headers, JsonBody}, Headers :: h2_headers(),
+      JsonBody :: binary().
 make_response(<<"POST">>, "/3/device/" ++ Token, #?S{} = State) ->
     handle_post(Token, State);
 make_response(<<"POST">>, _Other, #?S{uuid_re=RE,
@@ -232,7 +263,7 @@ handle_post(Token, #?S{uuid_re=RE,
                        peercert=Cert}=S) ->
     lager:debug("[StrId:~B]\nReq: ~p\nCert: ~p", [StrmId, S#?S.req, Cert]),
     try
-        ApnsIdHdr = check_apns_id_hdr(Headers, RE),
+        {ok, ApnsIdHdr} = check_apns_id_hdr(Headers, RE),
         RespHdrs = [ApnsIdHdr],
         check_apns_token(Token),
         Prio0 = pv(<<"apns-priority">>, Headers),
@@ -409,12 +440,12 @@ check_apns_id_hdr(Headers, RE) ->
         {<<"apns-id">>, UUID} = Hdr ->
             case re:run(binary_to_list(UUID), RE, [{capture, none}]) of
                 match ->
-                    Hdr;
+                    {ok, Hdr};
                 nomatch ->
-                    throw({status, 'BadMessageId'})
+                    {'BadMessageId', Hdr}
             end;
         false ->
-            make_apns_id_hdr()
+            {ok, make_apns_id_hdr()}
     end.
 
 %%--------------------------------------------------------------------
@@ -484,24 +515,28 @@ check_payload(Payload) ->
 %%--------------------------------------------------------------------
 %% Verify the JWT
 %%--------------------------------------------------------------------
+-spec check_jwt_auth(Headers) -> Result when
+      Headers :: h2_headers(),
+      Result :: {ok, {cached | changed, JWT}} | {error, Status},
+      JWT :: binary(), Status :: atom().
 check_jwt_auth(Headers) ->
     Auth = assert_pv(<<"authorization">>, Headers,
                      {status, 'MissingProviderToken'}),
-    Topic = assert_pv(<<"apns-topic">>, Headers,
-                      {status, 'MissingTopic'}),
     JWT = extract_auth_token(Auth),
-    DecodedJWT = apns_jwt:decode_jwt(JWT),
     case apns_erl_sim_auth_cache:validate_jwt(JWT) of
-        ok ->
+        ok -> % JWT has not expired and is bitwise-identical to last good JWT
             {ok, {cached, JWT}};
         {error, _} ->
+            DecodedJWT = apns_jwt:decode_jwt(JWT),
+            Topic = assert_pv(<<"apns-topic">>, Headers,
+                              {status, 'MissingTopic'}),
             Key = get_key_for_jwt(DecodedJWT, Topic),
             case verify_jwt(DecodedJWT, Topic, Key) of
                 ok ->
                     apns_erl_sim_auth_cache:add_auth({jwt, JWT, ?JWT_EXPIRY}),
                     {ok, {changed, JWT}};
                 {error, Status}=Error when is_atom(Status) ->
-                    throw(Error)
+                    Error
             end
     end.
 
@@ -727,8 +762,11 @@ maybe_ts(_) ->
 -compile({inline, [maybe_ts/1]}).
 
 %%--------------------------------------------------------------------
-response_from_reason(ReasonName, ExtraHdrs, S) when is_atom(ReasonName) ->
-    {StsHdr, Reason} = status_hdr(ReasonName, S#?S.sts_hdrs),
+-spec response_from_reason(ReasonName, ExtraHdrs, State)  -> Result when
+      ReasonName :: atom(), ExtraHdrs :: h2_headers(), State :: state(),
+      Result :: {Headers, JSON}, Headers :: h2_headers(), JSON :: binary().
+response_from_reason(ReasonName, ExtraHdrs, State) when is_atom(ReasonName) ->
+    {StsHdr, Reason} = status_hdr(ReasonName, State#?S.sts_hdrs),
     {[StsHdr | ExtraHdrs], Reason}.
 
 %%--------------------------------------------------------------------

@@ -29,6 +29,7 @@
              apns_erl_sim,
              apns_erl_sim_auth_cache,
              apns_erl_sim_app,
+             apns_erl_sim_ranch_protocol,
              apns_erl_sim_stream,
              apns_erl_sim_sup
             ]},
