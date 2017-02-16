@@ -130,8 +130,10 @@ get_key(<<Kid/binary>>, <<Iss/binary>>, <<Topic/binary>>) ->
                       {stop, Reason::term()} |
                       'ignore'
                       .
-init(Args) ->
-    {ok, #?S{jwt_key_path=proplists:get_value(jwt_key_path, Args)}}.
+init([Props]=Args) ->
+    lager:debug("Args: ~p", [Args]),
+    JWTKeyPath = sc_util:req_val(jwt_key_path, Props),
+    {ok, #?S{jwt_key_path=JWTKeyPath}}.
 
 %%--------------------------------------------------------------------
 %% @private

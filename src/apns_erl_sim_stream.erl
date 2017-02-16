@@ -172,11 +172,14 @@ handle_request_headers(Headers, #?S{uuid_re=RE}=S) ->
     Res = try
               handle_request_headers_nocatch(Headers, S)
           catch
-              error:{badmatch, Status} ->
+              error:{badmatch, Status}=Exc ->
+                  lager:error("Reqhdr exception: ~p", [Exc]),
                   response_from_reason(Status, [apns_id_hdr(Headers, RE)], S);
-              throw:{status_with_apns_id, {Status, IdHdr}} ->
+              throw:{status_with_apns_id, {Status, IdHdr}}=Exc ->
+                  lager:error("Reqhdr exception: ~p", [Exc]),
                   response_from_reason(Status, [IdHdr], S);
-              throw:{status, Status} ->
+              throw:{status, Status}=Exc ->
+                  lager:error("Reqhdr exception: ~p", [Exc]),
                   response_from_reason(Status, [apns_id_hdr(Headers, RE)], S)
           end,
     case Res of
@@ -195,12 +198,14 @@ handle_request_headers_nocatch(Headers, #?S{uuid_re=RE,
                                             mcs_changed=MCSCh}=State) ->
     lager:info("[StrId:~B] Hdrs: ~p\nReq: ~p", [SID, Headers, Req]),
     case check_jwt_auth(Headers) of
-        {ok, Status} ->
+        {ok, {Status, _JWT}} ->
             ReqMap = check_headers(Headers, undefined, RE),
             {ok, State#?S{req=Req#req{headers=Headers, map=ReqMap},
                           mcs_changed=maybe_maximize_mcs(CID, Status, MCSCh)}};
 
         {error, Status} when is_atom(Status) ->
+            lager:warning("[StrId:~B] JWT auth FAILED: ~p\nHdrs: ~p",
+                          [SID, Status, Headers]),
             ExtraHdrs = [apns_id_hdr(Headers, RE)],
             {RspHdrs, RspBody} = response_from_reason(Status, ExtraHdrs, State),
             {ok, State#?S{rsp=#rsp{headers=RspHdrs, data=RspBody}}}
@@ -535,15 +540,24 @@ check_payload(Payload) ->
 check_jwt_auth(Headers) ->
     Auth = assert_pv(<<"authorization">>, Headers,
                      {status, 'MissingProviderToken'}),
+    Topic = assert_pv(<<"apns-topic">>, Headers,
+                      {status, 'MissingTopic'}),
     JWT = extract_auth_token(Auth),
     case apns_erl_sim_auth_cache:validate_jwt(JWT) of
         ok -> % JWT has not expired and is bitwise-identical to last good JWT
             {ok, {cached, JWT}};
         {error, _} ->
-            MaybeDecodedJWT = apns_jwt:decode_jwt(JWT),
-            Topic = assert_pv(<<"apns-topic">>, Headers,
-                              {status, 'MissingTopic'}),
-            case verify_jwt(MaybeDecodedJWT, Topic) of
+            decode_and_verify_jwt(JWT, Topic)
+    end.
+
+%%--------------------------------------------------------------------
+decode_and_verify_jwt(JWT, Topic) ->
+    case apns_jwt:decode_jwt(JWT) of
+        {error, Reason} = Error ->
+            lager:error("Error decoding jwt: ~p", [Reason]),
+            Error;
+        DecodedJWT ->
+            case verify_jwt(DecodedJWT, Topic) of
                 ok ->
                     apns_erl_sim_auth_cache:add_auth({jwt, JWT, ?JWT_EXPIRY}),
                     {ok, {changed, JWT}};
@@ -564,16 +578,23 @@ extract_auth_token(_Auth) ->
     throw({status, 'InvalidProviderToken'}).
 
 %%--------------------------------------------------------------------
--spec get_key_for_jwt({Hdr, Payl, Sig, SigInput}, Topic) -> Result when
+-spec load_key_for_jwt({Hdr, Payl, Sig, SigInput}, Topic) -> Result when
       Hdr :: jsx:json_term(), Payl :: jsx:json_term(), Sig :: binary(),
-      SigInput :: binary(), Topic :: binary(), Result :: ec_private_key().
-get_key_for_jwt({Hdr, Payl, _, _}, Topic) ->
+      SigInput :: binary(), Topic :: binary(),
+      Result :: {Kid, Iss, PK}, Kid :: binary(), Iss :: binary(),
+      PK :: ec_private_key().
+load_key_for_jwt({Hdr, Payl, _, _}, Topic) ->
     Kid = assert_pv(<<"kid">>, Hdr, {status, 'InvalidProviderToken'}),
     Iss = assert_pv(<<"iss">>, Payl, {status, 'InvalidProviderToken'}),
     case apns_erl_sim:get_key(Kid, Iss, Topic) of
         {ok, Key} ->
-            Key;
+            {Kid, Iss, Key};
+        {error, jwt_key_path_undefined}=Crash ->
+            lager:critical("Configuration error: jwt key path undefined"),
+            erlang:exit(Crash);
         {error, _} ->
+            lager:warning("Cannot load key for kid=~s, iss=~s, topic=~s",
+                          [Kid, Iss, Topic]),
             throw({status, 'InvalidProviderToken'})
     end.
 
@@ -585,22 +606,16 @@ get_key_for_jwt({Hdr, Payl, _, _}, Topic) ->
       Result :: ok
               | {error, 'InvalidProviderToken'}
               | {error, 'ExpiredProviderToken'}.
-verify_jwt({Hdr, _Payl, _Sig, _SigInput}=DecodedJWT, <<Topic/binary>>) ->
-    Key = get_key_for_jwt(DecodedJWT, Topic),
-    Kid = assert_pv(<<"kid">>, Hdr, {status, 'InvalidProviderToken'}),
-    %% We use Topic for the ctx because verify_jwt will check
-    %% iss against it. If we used iss, we would be checking it against
-    %% itself.
-    Ctx = apns_jwt:new(Kid, Topic, Key),
+verify_jwt({_Hdr, _Payl, _Sig, _SigInput}=DecodedJWT, <<Topic/binary>>) ->
+    {Kid, Iss, Key} = load_key_for_jwt(DecodedJWT, Topic),
+    Ctx = apns_jwt:new(Kid, Iss, Key),
     case apns_jwt:verify_jwt(DecodedJWT, Ctx) of
         ok ->
             ok;
         {error, Error} ->
             lager:error("Error verifying jwt: ~p", [Error]),
             convert_verify_jwt_error(Error)
-    end;
-verify_jwt({error, _Reason}, <<_Topic/binary>>) ->
-    {error, 'InvalidProviderToken'}.
+    end.
 
 %%--------------------------------------------------------------------
 %% @private

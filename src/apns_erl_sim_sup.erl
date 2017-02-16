@@ -71,6 +71,8 @@ init({RanchTcpProto, Options}) when (RanchTcpProto == ranch_ssl orelse
                   modules  => [apns_erl_sim_auth_cache]},
 
     SimOpts = [{jwt_key_path, get_jwt_keypath()}],
+    lager:debug("SimOpts: ~p", [SimOpts]),
+
 
     SimSpec = #{id       => apns_erl_sim,
                 start    => {apns_erl_sim, start_link, [SimOpts]},
@@ -97,5 +99,6 @@ init({RanchTcpProto, Options}) when (RanchTcpProto == ranch_ssl orelse
 %%====================================================================
 get_jwt_keypath() ->
     {ok, App} = application:get_application(?MODULE),
-    application:get_env(App, jwt_key_path).
+    {ok, JwtKeypath} = application:get_env(App, jwt_key_path),
+    JwtKeypath.
 
