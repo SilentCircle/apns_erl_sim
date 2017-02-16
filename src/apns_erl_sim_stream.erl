@@ -61,6 +61,13 @@
 
 -type req_rec() :: #req{}.
 
+-record(rsp, {
+          headers = []   :: h2_headers(),
+          data    = <<>> :: h2_data()
+         }).
+
+-type rsp_rec() :: #rsp{}.
+
 -record(stream, {
           conn_pid  :: pid(),
           id        :: stream_id()
@@ -71,14 +78,15 @@
 -type ec_private_key() :: #'ECPrivateKey'{}.
 
 -record(?S, {
-           req                    = #req{} :: req_rec(),
-           stream                 = #stream{} :: stream_rec(),
-           peercert               = undefined :: undefined | none | map(),
-           mcs_changed            = false :: boolean(),
+           req          = #req{} :: req_rec(),
+           rsp          = undefined :: undefined | rsp_rec(), % Only for header-based errors
+           peercert     = undefined :: undefined | none | map(),
+           mcs_changed  = false :: boolean(),
            %% These don't change once assigned
-           uuid_re                = undefined :: undefined | re:mp(),
-           reasons                = reasons() :: map(),
-           sts_hdrs               = status_hdrs() :: map()
+           stream       = #stream{} :: stream_rec(),
+           uuid_re      = undefined :: undefined | re:mp(),
+           reasons      = reasons() :: map(),
+           sts_hdrs     = status_hdrs() :: map()
           }).
 
 -type state() :: #?S{}.
@@ -97,20 +105,10 @@ init(ConnPid, StrmId) ->
 %%--------------------------------------------------------------------
 -spec on_receive_request_headers(Headers, State) -> Result when
       Headers :: h2_headers(), State :: state(), Result :: {ok, state()}.
-on_receive_request_headers(Headers, #?S{stream=#stream{id=StrmId,
-                                                       conn_pid=ConnPid},
-                                        peercert=undefined % First time
-                                       }=State) ->
-    PeerCert = case get_and_check_peercert(ConnPid) of
-                   undefined ->
-                       lager:debug("[StrId:~B] Using token-based auth",
-                                   [StrmId]),
-                       none;
-                   Cert ->
-                       lager:debug("[StrId:~B] Using cert-based auth",
-                                   [StrmId]),
-                       Cert
-               end,
+on_receive_request_headers(Headers, #?S{peercert=undefined}=State) ->
+    {AuthBasis, PeerCert} = get_auth_method(State#?S.stream#stream.conn_pid),
+    lager:debug("[StrId:~B] Using ~p-based auth", [State#?S.stream#stream.id,
+                                                   AuthBasis]),
     handle_request_headers(Headers, State#?S{peercert=PeerCert});
 on_receive_request_headers(Headers, State) ->
     handle_request_headers(Headers, State).
@@ -131,13 +129,18 @@ on_receive_request_data(Bin, #?S{stream=Strm, req=#req{data=Data}=Req}=State) ->
     {ok, State#?S{req=Req#req{data = <<Data/binary, Bin/binary>>}}}.
 
 %%--------------------------------------------------------------------
+on_request_end_stream(#?S{stream=#stream{id=StrmId,
+                                         conn_pid=ConnId}, rsp=#rsp{}=R}=S) ->
+    Rsp = {R#rsp.headers, R#rsp.data},
+    lager:warning("[StrId:~B] sending error response ~p", [StrmId, Rsp]),
+    send_response(ConnId, StrmId, Rsp),
+    {ok, S#?S{req=#req{}, rsp=#rsp{}}}; % Be paranoid and clear req/rsp data
 on_request_end_stream(#?S{stream=#stream{id=StrmId}, req=Req} = State) ->
     lager:info("[StrId:~B] Req: ~p", [StrmId, Req]),
     Headers = Req#req.headers,
-    Method = pv(<<":method">>, Headers),
-    Path = binary_to_list(pv(<<":path">>, Headers)),
-
-    lager:debug("[StrId:~B] method:~s path:~s", [StrmId, Method, Path]),
+    Method = pv(<<":method">>, Headers, <<>>),
+    Path = binary_to_list(pv(<<":path">>, Headers, <<>>)),
+    lager:debug("[StrId:~B] method:~p path:~p", [StrmId, Method, Path]),
     handle_request(Method, Path, State),
     {ok, State#?S{req=#req{}}}. % Be paranoid and clear req data
 
@@ -179,10 +182,8 @@ handle_request_headers(Headers, #?S{uuid_re=RE}=S) ->
     case Res of
         {ok, #?S{}=_NewState} ->
             Res;
-        {_Headers, _Body}=Resp ->
-            #?S{stream=#stream{conn_pid=CID, id=SID}}=S,
-            send_response(CID, SID, Resp),
-            {ok, S}
+        {RspHdrs, RspBody} -> % Save response for end of stream
+            {ok, S#?S{rsp=#rsp{headers=RspHdrs, data=RspBody}}}
     end.
 
 %%--------------------------------------------------------------------
@@ -200,9 +201,9 @@ handle_request_headers_nocatch(Headers, #?S{uuid_re=RE,
                           mcs_changed=maybe_maximize_mcs(CID, Status, MCSCh)}};
 
         {error, Status} when is_atom(Status) ->
-            Resp = response_from_reason(Status, [apns_id_hdr(Headers, RE)], State),
-            send_response(CID, SID, Resp),
-            {ok, State}
+            ExtraHdrs = [apns_id_hdr(Headers, RE)],
+            {RspHdrs, RspBody} = response_from_reason(Status, ExtraHdrs, State),
+            {ok, State#?S{rsp=#rsp{headers=RspHdrs, data=RspBody}}}
     end;
 handle_request_headers_nocatch(Headers, #?S{stream=#stream{id=StrmId},
                                             req=Req,
@@ -223,6 +224,15 @@ maybe_maximize_mcs(_CID, Status, MCSChanged) when Status =:= changed orelse
 change_MCS(MCS, ConnPid) ->
     Settings = #settings{max_concurrent_streams=MCS},
     h2_connection:update_settings(ConnPid, Settings).
+
+%%--------------------------------------------------------------------
+get_auth_method(ConnPid) ->
+    case get_and_check_peercert(ConnPid) of
+        undefined ->
+            {token, none};
+        Cert ->
+            {cert, Cert}
+    end.
 
 %%--------------------------------------------------------------------
 get_and_check_peercert(ConnPid) ->
@@ -246,6 +256,10 @@ handle_request(Method, Path, #?S{stream=#stream{id=SID,
       Method :: binary(), Path :: string(), State :: state(),
       Result :: {Headers, JsonBody}, Headers :: h2_headers(),
       JsonBody :: binary().
+make_response(_Method, _Path,
+              #?S{rsp=#rsp{headers=Hs, data=Body}}) when Hs /= [];
+                                                         Body /= <<>> ->
+    {Hs, Body};
 make_response(<<"POST">>, "/3/device/" ++ Token, #?S{} = State) ->
     handle_post(Token, State);
 make_response(<<"POST">>, _Other, #?S{uuid_re=RE,
@@ -266,10 +280,9 @@ handle_post(Token, #?S{uuid_re=RE,
         {ok, ApnsIdHdr} = check_apns_id_hdr(Headers, RE),
         RespHdrs = [ApnsIdHdr],
         check_apns_token(Token),
-        Prio0 = pv(<<"apns-priority">>, Headers),
         JSON = check_payload(Payload),
         APS = pv(<<"aps">>, JSON, []),
-        {ok, Prio} = check_body(APS, Prio0),
+        {ok, Prio} = check_body(APS, pv(<<"apns-priority">>, Headers)),
         ReqMap = ReqMap0#{apns_priority => Prio,
                           apns_json => JSON,
                           apns_aps_dict => APS},
@@ -527,11 +540,10 @@ check_jwt_auth(Headers) ->
         ok -> % JWT has not expired and is bitwise-identical to last good JWT
             {ok, {cached, JWT}};
         {error, _} ->
-            DecodedJWT = apns_jwt:decode_jwt(JWT),
+            MaybeDecodedJWT = apns_jwt:decode_jwt(JWT),
             Topic = assert_pv(<<"apns-topic">>, Headers,
                               {status, 'MissingTopic'}),
-            Key = get_key_for_jwt(DecodedJWT, Topic),
-            case verify_jwt(DecodedJWT, Topic, Key) of
+            case verify_jwt(MaybeDecodedJWT, Topic) of
                 ok ->
                     apns_erl_sim_auth_cache:add_auth({jwt, JWT, ?JWT_EXPIRY}),
                     {ok, {changed, JWT}};
@@ -567,13 +579,14 @@ get_key_for_jwt({Hdr, Payl, _, _}, Topic) ->
 
 %%--------------------------------------------------------------------
 %% @private
--spec verify_jwt({Hdr, Payl, Sig, SigInput}, Topic, Key) -> Result when
+-spec verify_jwt({Hdr, Payl, Sig, SigInput}, Topic) -> Result when
       Hdr :: jsx:json_term(), Payl :: jsx:json_term(), Sig :: binary(),
-      SigInput :: binary(), Topic :: binary(), Key :: ec_private_key(),
+      SigInput :: binary(), Topic :: binary(),
       Result :: ok
               | {error, 'InvalidProviderToken'}
               | {error, 'ExpiredProviderToken'}.
-verify_jwt({Hdr, _Payl, _Sig, _SigInput}=DecodedJWT, <<Topic/binary>>, Key) ->
+verify_jwt({Hdr, _Payl, _Sig, _SigInput}=DecodedJWT, <<Topic/binary>>) ->
+    Key = get_key_for_jwt(DecodedJWT, Topic),
     Kid = assert_pv(<<"kid">>, Hdr, {status, 'InvalidProviderToken'}),
     %% We use Topic for the ctx because verify_jwt will check
     %% iss against it. If we used iss, we would be checking it against
@@ -585,7 +598,9 @@ verify_jwt({Hdr, _Payl, _Sig, _SigInput}=DecodedJWT, <<Topic/binary>>, Key) ->
         {error, Error} ->
             lager:error("Error verifying jwt: ~p", [Error]),
             convert_verify_jwt_error(Error)
-    end.
+    end;
+verify_jwt({error, _Reason}, <<_Topic/binary>>) ->
+    {error, 'InvalidProviderToken'}.
 
 %%--------------------------------------------------------------------
 %% @private

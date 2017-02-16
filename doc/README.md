@@ -4,7 +4,7 @@
 
 Copyright (c) 2016 Silent Circle, LLC.
 
-__Version:__ 0.9.0
+__Version:__ 0.10.0
 
 __Authors:__ Edwin Fine ([`efine@silentcircle.com`](mailto:efine@silentcircle.com)).
 
@@ -130,6 +130,7 @@ See `rebar.config.script` for usage and behavior.
 <tr><td><a href="apns_erl_sim.md" class="module">apns_erl_sim</a></td></tr>
 <tr><td><a href="apns_erl_sim_app.md" class="module">apns_erl_sim_app</a></td></tr>
 <tr><td><a href="apns_erl_sim_auth_cache.md" class="module">apns_erl_sim_auth_cache</a></td></tr>
+<tr><td><a href="apns_erl_sim_ranch_protocol.md" class="module">apns_erl_sim_ranch_protocol</a></td></tr>
 <tr><td><a href="apns_erl_sim_stream.md" class="module">apns_erl_sim_stream</a></td></tr>
 <tr><td><a href="apns_erl_sim_sup.md" class="module">apns_erl_sim_sup</a></td></tr></table>
 
