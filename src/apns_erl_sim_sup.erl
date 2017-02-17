@@ -36,19 +36,21 @@
 %% API functions
 %%====================================================================
 
-start_link({TcpProto, Options}=Arg) when (TcpProto == ranch_ssl orelse
-                                          TcpProto == ranch_tcp)
-                                         andalso is_list(Options) ->
+start_link({TcpProto, RanchOpts, ProtocolOpts}=Arg)
+  when (TcpProto == ranch_ssl orelse TcpProto == ranch_tcp)
+       andalso is_list(RanchOpts)
+       andalso is_list(ProtocolOpts)->
     supervisor:start_link({local, ?SERVER}, ?MODULE, Arg).
 
 %%====================================================================
 %% Supervisor callbacks
 %%====================================================================
 
-%% Child :: {Id,StartFunc,Restart,Shutdown,Type,Modules}
-init({RanchTcpProto, Options}) when (RanchTcpProto == ranch_ssl orelse
-                                     RanchTcpProto == ranch_tcp) andalso
-                                    is_list(Options) ->
+init({RanchTcpProto, RanchOpts,
+      ProtocolOpts}) when (RanchTcpProto == ranch_ssl orelse
+                           RanchTcpProto == ranch_tcp) andalso
+                          is_list(RanchOpts) andalso
+                          is_list(ProtocolOpts) ->
     RanchSupSpec = #{id       => ranch_sup,
                      start    => {ranch_sup, start_link, []},
                      restart  => permanent,
@@ -59,9 +61,9 @@ init({RanchTcpProto, Options}) when (RanchTcpProto == ranch_ssl orelse
     ListenerSpec = ranch:child_spec(apns_erl_sim_ranch_protocol,
                                     ?NUM_ACCEPTORS,
                                     RanchTcpProto,
-                                    Options,
+                                    RanchOpts,
                                     apns_erl_sim_ranch_protocol,
-                                    []),
+                                    ProtocolOpts),
 
     CacheSpec = #{id       => apns_erl_sim_auth_cache,
                   start    => {apns_erl_sim_auth_cache, start_link, []},

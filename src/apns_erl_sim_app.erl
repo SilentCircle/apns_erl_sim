@@ -36,11 +36,12 @@ start(_StartType, _StartArgs) ->
                         {ok, true} -> ranch_ssl;
                         _          -> ranch_tcp
                     end,
-    Options = case application:get_env(chatterbox, ssl_options) of
+    RanchOpts = case application:get_env(chatterbox, ssl_options) of
                   {ok, SslOpts} -> SslOpts;
                   _             -> default_options(RanchTcpProto)
-              end ++ [{http2_settings, Http2Settings}],
-    apns_erl_sim_sup:start_link({RanchTcpProto, Options}).
+              end,
+    ProtocolOpts = [{http2_settings, Http2Settings}],
+    apns_erl_sim_sup:start_link({RanchTcpProto, RanchOpts, ProtocolOpts}).
 
 %%--------------------------------------------------------------------
 stop(_State) ->
