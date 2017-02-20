@@ -26,7 +26,7 @@ compile: $(REBAR)
 	$(REBAR) do clean, compile
 
 run: $(REBAR)
-	$(REBAR) shell
+	$(REBAR) shell $(EXTRA_SHELL_ARGS)
 
 clean: docclean
 	$(REBAR) clean
