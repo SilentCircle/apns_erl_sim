@@ -105,13 +105,22 @@ init(ConnPid, StrmId) ->
 %%--------------------------------------------------------------------
 -spec on_receive_request_headers(Headers, State) -> Result when
       Headers :: h2_headers(), State :: state(), Result :: {ok, state()}.
-on_receive_request_headers(Headers, #?S{peercert=undefined}=State) ->
-    {AuthBasis, PeerCert} = get_auth_method(State#?S.stream#stream.conn_pid),
-    lager:debug("[StrId:~B] Using ~p-based auth", [State#?S.stream#stream.id,
-                                                   AuthBasis]),
-    handle_request_headers(Headers, State#?S{peercert=PeerCert});
-on_receive_request_headers(Headers, State) ->
-    handle_request_headers(Headers, State).
+on_receive_request_headers(Headers, #?S{uuid_re=RE}=S) ->
+    Res = try handle_request_headers_nocatch(Headers, S) of
+              R ->
+                  R
+          catch
+              error:{badmatch, Status}=Exc ->
+                  lager:error("Reqhdr exception: ~p", [Exc]),
+                  response_from_reason(Status, [apns_id_hdr(Headers, RE)], S);
+              throw:{status_with_apns_id, {Status, IdHdr}}=Exc ->
+                  lager:error("Reqhdr exception: ~p", [Exc]),
+                  response_from_reason(Status, [IdHdr], S);
+              throw:{status, Status}=Exc ->
+                  lager:error("Reqhdr exception: ~p", [Exc]),
+                  response_from_reason(Status, [apns_id_hdr(Headers, RE)], S)
+          end,
+    result_to_state(Res, S).
 
 %%--------------------------------------------------------------------
 on_send_push_promise(Headers, #?S{stream=Strm, req=Req}=State) ->
@@ -149,6 +158,11 @@ on_request_end_stream(#?S{stream=#stream{id=StrmId}, req=Req} = State) ->
 %%% Internal functions
 %%%====================================================================
 
+result_to_state({ok, #?S{}}=Res, _S) ->
+    Res;
+result_to_state({RspHdrs, RspBody}, #?S{}=S) ->
+    {ok, S#?S{rsp=#rsp{headers=RspHdrs, data=RspBody}}}.
+
 %%--------------------------------------------------------------------
 make_state(ConnPid, StrmId) ->
     {ok, RE} = re:compile(?UUID_RE),
@@ -168,58 +182,61 @@ generate_push_promise_headers(Request, Path) ->
 
 
 %%--------------------------------------------------------------------
-handle_request_headers(Headers, #?S{uuid_re=RE}=S) ->
-    Res = try
-              handle_request_headers_nocatch(Headers, S)
-          catch
-              error:{badmatch, Status}=Exc ->
-                  lager:error("Reqhdr exception: ~p", [Exc]),
-                  response_from_reason(Status, [apns_id_hdr(Headers, RE)], S);
-              throw:{status_with_apns_id, {Status, IdHdr}}=Exc ->
-                  lager:error("Reqhdr exception: ~p", [Exc]),
-                  response_from_reason(Status, [IdHdr], S);
-              throw:{status, Status}=Exc ->
-                  lager:error("Reqhdr exception: ~p", [Exc]),
-                  response_from_reason(Status, [apns_id_hdr(Headers, RE)], S)
-          end,
-    case Res of
-        {ok, #?S{}=_NewState} ->
-            Res;
-        {RspHdrs, RspBody} -> % Save response for end of stream
-            {ok, S#?S{rsp=#rsp{headers=RspHdrs, data=RspBody}}}
-    end.
-
-%%--------------------------------------------------------------------
 handle_request_headers_nocatch(Headers, #?S{uuid_re=RE,
                                             req=Req,
                                             stream=#stream{conn_pid=CID,
                                                            id=SID},
-                                            peercert=none, % Not cert-based
-                                            mcs_changed=MCSCh}=State) ->
+                                            peercert=undefined,
+                                            mcs_changed=MCSCh0}=State) ->
     lager:info("[StrId:~B] Hdrs: ~p\nReq: ~p", [SID, Headers, Req]),
     case check_jwt_auth(Headers) of
         {ok, {Status, _JWT}} ->
             ReqMap = check_headers(Headers, undefined, RE),
+            MCSCh = maybe_maximize_mcs(CID, Status, MCSCh0),
             {ok, State#?S{req=Req#req{headers=Headers, map=ReqMap},
-                          mcs_changed=maybe_maximize_mcs(CID, Status, MCSCh)}};
-
+                          mcs_changed=MCSCh}};
         {error, Status} when is_atom(Status) ->
             lager:warning("[StrId:~B] JWT auth FAILED: ~p\nHdrs: ~p",
                           [SID, Status, Headers]),
             ExtraHdrs = [apns_id_hdr(Headers, RE)],
-            {RspHdrs, RspBody} = response_from_reason(Status, ExtraHdrs, State),
-            {ok, State#?S{rsp=#rsp{headers=RspHdrs, data=RspBody}}}
-    end;
-handle_request_headers_nocatch(Headers, #?S{stream=#stream{id=StrmId},
-                                            req=Req,
-                                            peercert=PCI}=State) ->
-    lager:info("[StrId:~B] Hdrs: ~p\nReq: ~p", [StrmId, Headers, Req]),
-    ReqMap = check_headers(Headers, PCI, State#?S.uuid_re),
-    {ok, State#?S{req=Req#req{headers=Headers, map=ReqMap}}}.
+            {RspHdrs, RspBody} = response_from_reason(Status, ExtraHdrs,
+                                                      State),
+            {ok, State#?S{rsp=#rsp{headers=RspHdrs, data=RspBody}}};
+        no_auth_header ->
+            case maybe_get_cert_info(CID) of
+                {ok, PeerCert} -> % Ok, it's cert-based
+                    ReqMap = check_headers(Headers, PeerCert, RE),
+                    lager:debug("[StrId:~B] Using cert-based auth", [SID]),
+                    {ok, State#?S{req=Req#req{headers=Headers, map=ReqMap},
+                                  peercert=PeerCert}};
+                {error, Reason} -> % well, darn, and there's no auth header.
+                    ExtraHdrs = [apns_id_hdr(Headers, RE)],
+                    lager:warning("[StrId:~B] Missing provider token "
+                                  "because of ~p", [SID, {error, Reason}]),
+                    Status = 'MissingProviderToken',
+                    {RspHdrs, RspBody} = response_from_reason(Status,
+                                                              ExtraHdrs,
+                                                              State),
+                    {ok, State#?S{rsp=#rsp{headers=RspHdrs, data=RspBody}}}
+            end
+    end.
+
+%%--------------------------------------------------------------------
+maybe_get_cert_info(CID) ->
+    case get_auth_method(CID) of
+        {cert, PeerCert} -> % Ok, it's cert-based
+            {ok, PeerCert};
+        {token, _} -> % well, darn - no auth header.
+            {error, 'MissingProviderToken'}
+    end.
 
 %%--------------------------------------------------------------------
 maybe_maximize_mcs(CID, changed=_Status, false=_MCSChanged) ->
-    ok = change_MCS(?MAX_CONCURRENT_STREAMS, CID),
+    %% If change_MCS doesn't work, don't crash this because
+    %% it's likely that the connection has dropped, so let the
+    %% connection handle it - it's not fatal if MCS stays at 1
+    %% until this stream goes away.
+    _ = change_MCS(?MAX_CONCURRENT_STREAMS, CID),
     true;
 maybe_maximize_mcs(_CID, Status, MCSChanged) when Status =:= changed orelse
                                                   Status =:= cached ->
@@ -228,7 +245,17 @@ maybe_maximize_mcs(_CID, Status, MCSChanged) when Status =:= changed orelse
 %%--------------------------------------------------------------------
 change_MCS(MCS, ConnPid) ->
     Settings = #settings{max_concurrent_streams=MCS},
-    h2_connection:update_settings(ConnPid, Settings).
+    try h2_connection:update_settings(ConnPid, Settings) of
+        Resp ->
+            Resp
+    catch
+        exit:{noproc, Info} ->
+            lager:error("h2_connection (pid ~p) gone: ~p", [ConnPid, Info]),
+            {error, connection_closed};
+        exit:{timeout, Info} ->
+            lager:error("h2_connection (pid ~p) timeout: ~p", [ConnPid, Info]),
+            {error, timeout}
+    end.
 
 %%--------------------------------------------------------------------
 get_auth_method(ConnPid) ->
@@ -241,12 +268,19 @@ get_auth_method(ConnPid) ->
 
 %%--------------------------------------------------------------------
 get_and_check_peercert(ConnPid) ->
-    case h2_connection:get_peercert(ConnPid) of
+    try h2_connection:get_peercert(ConnPid) of
         {ok, PeerCertDer} ->
             PeerCert = apns_cert:der_decode_cert(PeerCertDer),
             apns_cert:get_cert_info_map(PeerCert);
         {error, _} ->
             undefined
+    catch
+        exit:{noproc, Info} ->
+            lager:error("h2_connection (pid ~p) gone: ~p", [ConnPid, Info]),
+            {error, connection_closed};
+        exit:{timeout, Info} ->
+            lager:error("h2_connection (pid ~p) timeout: ~p", [ConnPid, Info]),
+            {error, timeout}
     end.
 
 %%--------------------------------------------------------------------
@@ -535,19 +569,25 @@ check_payload(Payload) ->
 %%--------------------------------------------------------------------
 -spec check_jwt_auth(Headers) -> Result when
       Headers :: h2_headers(),
-      Result :: {ok, {cached | changed, JWT}} | {error, Status},
+      Result :: {ok, {cached | changed, JWT}}
+              | {error, Status}
+              | no_auth_header,
       JWT :: binary(), Status :: atom().
 check_jwt_auth(Headers) ->
-    Auth = assert_pv(<<"authorization">>, Headers,
-                     {status, 'MissingProviderToken'}),
-    Topic = assert_pv(<<"apns-topic">>, Headers,
-                      {status, 'MissingTopic'}),
-    JWT = extract_auth_token(Auth),
-    case apns_erl_sim_auth_cache:validate_jwt(JWT) of
-        ok -> % JWT has not expired and is bitwise-identical to last good JWT
-            {ok, {cached, JWT}};
-        {error, _} ->
-            decode_and_verify_jwt(JWT, Topic)
+    case pv(<<"authorization">>, Headers) of
+        undefined ->
+            no_auth_header;
+        Auth ->
+            Topic = assert_pv(<<"apns-topic">>, Headers,
+                              {status, 'MissingTopic'}),
+            JWT = extract_auth_token(Auth),
+            case apns_erl_sim_auth_cache:validate_jwt(JWT) of
+                ok -> % JWT has not expired and is bitwise-identical to
+                      % last good JWT
+                    {ok, {cached, JWT}};
+                {error, _} ->
+                    decode_and_verify_jwt(JWT, Topic)
+            end
     end.
 
 %%--------------------------------------------------------------------
