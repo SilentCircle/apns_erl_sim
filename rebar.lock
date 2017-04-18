@@ -5,7 +5,7 @@
   0},
  {<<"chatterbox">>,
   {git,"https://github.com/joedevivo/chatterbox.git",
-       {ref,"adb3474dbf7c90998d9316e9bd9caf8c0be5ae33"}},
+       {ref,"52b385315e2a1fe3b7ee8672e91e9c9c0ca90c87"}},
   0},
  {<<"edown">>,
   {git,"https://github.com/uwiger/edown.git",

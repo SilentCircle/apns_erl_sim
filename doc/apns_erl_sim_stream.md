@@ -58,10 +58,10 @@ state() = #'?S'{}
 ### init/2 ###
 
 <pre><code>
-init(ConnPid, StreamId) -&gt; Result
+init(ConnPid, StrmId) -&gt; Result
 </code></pre>
 
-<ul class="definitions"><li><code>ConnPid = pid()</code></li><li><code>StreamId = <a href="#type-stream_id">stream_id()</a></code></li><li><code>Result = {ok, <a href="#type-state">state()</a>}</code></li></ul>
+<ul class="definitions"><li><code>ConnPid = pid()</code></li><li><code>StrmId = <a href="#type-stream_id">stream_id()</a></code></li><li><code>Result = {ok, <a href="#type-state">state()</a>}</code></li></ul>
 
 <a name="on_receive_request_data-2"></a>
 
